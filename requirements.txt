@@ -5,3 +5,4 @@ xxhash
 numpy
 tqdm
 safetensors
+modelscope
