@@ -1,0 +1,7 @@
+torch>=2.4.0
+triton>=3.0.0
+transformers>=4.51.0
+xxhash
+numpy
+tqdm
+safetensors

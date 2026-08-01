@@ -1,66 +1,64 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
+# Nano-vLLM-optimized
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
-
-# Nano-vLLM
-
-A lightweight vLLM implementation built from scratch.
-
-## Key Features
-
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
 
 ## Installation
 
+This project requires an NVIDIA GPU and FlashAttention. The recommended platform is Linux or WSL2. Native Windows is not supported by the NCCL and FlashAttention dependencies used by the engine.
+
+### 1. Create the Conda environment
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+conda env create -f environment.yml
+conda activate nano-vllm
 ```
 
-## Model Download
+### 2. Install a matching FlashAttention wheel
 
-To download the model weights manually, use the following command:
+Download a prebuilt `.whl` from the [FlashAttention releases page](https://github.com/Dao-AILab/flash-attention/releases/). Select an asset that matches the current environment's:
+
+- Linux and `x86_64` platform;
+- Python version (this environment uses Python 3.10, so use a `cp310` wheel);
+- PyTorch version;
+- CUDA version; and
+- C++ ABI setting, when it is included in the wheel filename.
+
+Install the downloaded wheel without resolving dependencies online:
+
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+pip install --no-deps /path/to/flash_attn-<matching-version>.whl
 ```
 
-## Quick Start
+Verify the installation:
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
-```python
-from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
+```bash
+python -c "import torch, flash_attn; print(torch.__version__, torch.version.cuda, flash_attn.__version__)"
 ```
 
-## Benchmark
+### 3. Install Nano-vLLM-optimized
 
-See `bench.py` for benchmark.
+```bash
+git clone https://github.com/brightmoonflame/nano-vllm-optimized.git
+cd nano-vllm-optimized
+pip install -r requirements.txt
+pip install -e . --no-deps
+```
 
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+`--no-deps` prevents pip from trying to download or rebuild FlashAttention after the matching offline wheel has been installed.
 
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+## Serving Benchmark
 
+Run the benchmark with a local Hugging Face model directory:
 
-## Star History
+```bash
+python serving_bench.py \
+  --model /path/to/Qwen3-0.6B \
+  --num-requests 256 \
+  --request-rate 8 \
+  --max-input-len 1024 \
+  --max-output-len 1024 \
+  --max-model-len 4096 \
+  --seed 0
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+The script uses random token IDs to construct a synthetic workload. It is useful for observing scheduling, KV Cache behavior, and end-to-end request handling.
