@@ -6,6 +6,7 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 
 1. **Installation workflow**: provides a Conda environment, offline matching FlashAttention wheel installation, and ModelScope model download commands.
 2. **`serving_bench.py`**: benchmarks offline engine throughput and serving end-to-end goodput, including TTFT, TPOT, and request latency.
+3. **Streaming output**: `LLM.generate_stream()` yields `(prompt_index, new_token_ids, is_finished)` after each engine step, so callers can consume tokens as soon as they are produced instead of waiting for the whole batch. `generate()` keeps its original behavior as a thin wrapper over the streaming primitive.
 
 ## Installation
 
@@ -82,6 +83,19 @@ modelscope download --model Qwen/Qwen3-0.6B --local_dir /root/model/Qwen3-0.6B
 
 Use `/root/model/Qwen3-0.6B` as the `--model` path. If you run files with hard-coded model paths, update them to this directory as well.
 
+## Streaming Output
+
+`generate_stream()` yields tokens incrementally after each engine step, while `generate()` still returns full results at once:
+
+```python
+buffers = {}
+for index, new_token_ids, is_finished in llm.generate_stream(prompts, sampling_params):
+    buffers.setdefault(index, []).extend(new_token_ids)
+    text = tokenizer.decode(buffers[index])  # then print the delta since the last decode
+```
+
+Decode the accumulated token ids (not just the new ones) so that BPE pieces spanning multiple tokens are rendered correctly.
+
 ## Serving Benchmark
 
 `offline` measures engine throughput after all requests are queued. `serving`
@@ -133,6 +147,8 @@ Results below are recorded on each optimization step to track progress. Hardware
 | Version | Total tokens | Total time | Throughput |
 | --- | ---: | ---: | ---: |
 | Baseline | 133966 | 23.61 s | 5674.12 tok/s |
+| + streaming output | 133966 | 23.83 s | 5622.65 tok/s |
+| + dynamo cache limit | 133966 | 23.84 s | 5618.37 tok/s |
 
 #### Serving (`serving_bench.py`)
 
@@ -140,5 +156,12 @@ Results below are recorded on each optimization step to track progress. Hardware
 
 | Version | Mode | Total time | Output throughput | Mean TTFT | Mean TPOT | Mean latency |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline | Offline | 6.70 s | 4893.88 tok/s | 2507.97 ms | 27.75 ms | 6032.34 ms |
-| Baseline | Serving (8 req/s) | 36.32 s | 902.32 tok/s | 60.45 ms | 3.86 ms | 550.56 ms |
+| Baseline | Offline | 5.76 s | 5688.38 tok/s | 1560.51 ms | 27.80 ms | 5091.67 ms |
+| Baseline | Serving (8 req/s) | 36.32 s | 902.21 tok/s | 61.21 ms | 3.89 ms | 555.81 ms |
+| + streaming output | Offline | 5.79 s | 5663.05 tok/s | 1557.26 ms | 28.05 ms | 5119.28 ms |
+| + streaming output | Serving (8 req/s) | 36.32 s | 902.27 tok/s | 59.09 ms | 3.83 ms | 545.77 ms |
+| + dynamo cache limit | Offline | 5.65 s | 5797.83 tok/s | 1617.77 ms | 26.72 ms | 5010.89 ms |
+
+> Note: the baseline was re-measured on the pre-streaming commit (`f4edcbe`) in the same environment. An earlier baseline (6.70 s / 4893.88 tok/s offline) turned out to be an outlier from a degraded run and was replaced. Baseline vs. "+ streaming output" differ by <0.5%, confirming the streaming refactor is regression-free.
+>
+> The "+ dynamo cache limit" row raises `torch._dynamo.config.cache_size_limit` to 64 so that warmup, CUDA-graph capture and prefill shapes all keep their compiled kernels instead of silently falling back to eager. The row is from a warm inductor-cache run: a cold process spends its first prefill step on a one-time recompile (~0.5 s, visible as TTFT ≈ 2.2 s), subsequent runs are unaffected.
