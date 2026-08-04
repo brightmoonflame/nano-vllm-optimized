@@ -23,13 +23,13 @@ class RequestMetrics:
     completion_time: float | None = None
     output_len: int | None = None
 
-    def record_first_token(self, timestamp: float) -> None:
+    def record_new_tokens(self, timestamp: float, count: int) -> None:
         if self.first_token_time is None:
             self.first_token_time = timestamp
+        self.output_len = (self.output_len or 0) + count
 
-    def record_completion(self, timestamp: float, output_ids: list[int]) -> None:
+    def record_completion(self, timestamp: float) -> None:
         self.completion_time = timestamp
-        self.output_len = len(output_ids)
 
     def to_dict(self, start_time: float) -> dict:
         return {
@@ -340,15 +340,14 @@ def main() -> None:
                 requests_sent += 1
 
             if engine.scheduler.waiting or engine.scheduler.running:
-                finished_outputs, _ = engine.step()
+                step_outputs, _ = engine.step()
                 step_end_time = time.perf_counter()
-                for sequence in engine.scheduler.running:
-                    metrics[sequence.seq_id].record_first_token(step_end_time)
-                for sequence_id, output_ids in finished_outputs:
+                for sequence_id, new_token_ids, finished in step_outputs:
                     metric = metrics[sequence_id]
-                    metric.record_first_token(step_end_time)
-                    metric.record_completion(step_end_time, output_ids)
-                    progress_bar.update(1)
+                    metric.record_new_tokens(step_end_time, len(new_token_ids))
+                    if finished:
+                        metric.record_completion(step_end_time)
+                        progress_bar.update(1)
             elif requests_sent < args.num_requests:
                 next_arrival = start_time + scheduled_arrivals[requests_sent]
                 time.sleep(min(0.01, max(0.0, next_arrival - time.perf_counter())))
