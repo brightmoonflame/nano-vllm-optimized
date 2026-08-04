@@ -4,6 +4,10 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
+# warmup, CUDA-graph capture batch sizes and prefill shapes each need their own
+# compiled variant; the default limit (8) causes silent eager fallback.
+torch._dynamo.config.cache_size_limit = 64
+
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
