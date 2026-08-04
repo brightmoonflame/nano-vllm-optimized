@@ -122,11 +122,23 @@ python serving_bench.py \
   --output-json results/serving-rate8.json
 ```
 
-### Baseline Results
+### Results
 
-Qwen3-0.6B on an RTX 4090; 256 requests, fixed 512-token inputs and 128-token outputs.
+Results below are recorded on each optimization step to track progress. Hardware: Qwen3-0.6B on a single RTX 4090.
 
-| Mode | Total time | Output throughput | Mean TTFT | Mean TPOT | Mean latency |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Offline | 6.70 s | 4893.88 tok/s | 2507.97 ms | 27.75 ms | 6032.34 ms |
-| Serving (8 req/s) | 36.32 s | 902.32 tok/s | 60.45 ms | 3.86 ms | 550.56 ms |
+#### Engine throughput (`bench.py`)
+
+256 requests, input 100–1024 tokens (uniform), output 100–1024 tokens (uniform), `temperature=0.6`, `ignore_eos=True`.
+
+| Version | Total tokens | Total time | Throughput |
+| --- | ---: | ---: | ---: |
+| Baseline | 133966 | 23.61 s | 5674.12 tok/s |
+
+#### Serving (`serving_bench.py`)
+
+256 requests, fixed 512-token inputs and 128-token outputs.
+
+| Version | Mode | Total time | Output throughput | Mean TTFT | Mean TPOT | Mean latency |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline | Offline | 6.70 s | 4893.88 tok/s | 2507.97 ms | 27.75 ms | 6032.34 ms |
+| Baseline | Serving (8 req/s) | 36.32 s | 902.32 tok/s | 60.45 ms | 3.86 ms | 550.56 ms |
