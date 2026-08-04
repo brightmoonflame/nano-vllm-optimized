@@ -1,7 +1,14 @@
 import os
+import shutil
 import sys
+import unicodedata
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
+
+
+def display_width(text: str) -> int:
+    """Terminal column width of a line (CJK chars and most emoji take 2 columns)."""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
 
 
 def main():
@@ -22,19 +29,29 @@ def main():
         )
         for prompt in prompts
     ]
-    # Each request owns one block; on every delta the cursor returns to the top
-    # and both blocks are redrawn in place, like two typewriter-style chat boxes.
-    print("--- Streaming Output ---\n")
-    for i in range(len(prompts)):
-        print(f"[req {i}] \n")
+
+    # Each request owns one block that grows in place, like a chat box.
+    # The cursor moves up relative to the previous frame height (\x1b[nA),
+    # never absolute (\x1b[H), so scrollback history above stays untouched.
+    print("--- Streaming Output ---")
     texts = [""] * len(prompts)
+    frame_lines = 0  # physical terminal lines occupied by the previous frame
+
     for index, delta, _ in llm.generate_stream_text(prompts, sampling_params, use_tqdm=False):
         texts[index] += delta
-        frame = ["\x1b[H--- Streaming Output ---\x1b[K\n"]   # cursor home, redraw title
+        width = shutil.get_terminal_size().columns
+        lines = []
         for i, text in enumerate(texts):
-            frame.append(f"\n[req {i}] {text}\x1b[K\n")     # \x1b[K clears leftovers on the line
-        sys.stdout.write("".join(frame) + "\x1b[J")          # \x1b[J clears anything below
+            lines.extend(f"[req {i}] {text}".expandtabs().split("\n"))  # embedded \n and \t count as lines/columns
+            lines.append("")
+        sys.stdout.write("\r" + (f"\x1b[{frame_lines}A" if frame_lines else ""))
+        frame_lines = 0
+        for line in lines:
+            sys.stdout.write(line + "\x1b[K\n")
+            frame_lines += max(1, -(-display_width(line) // width))  # wrapped lines
+        sys.stdout.write("\x1b[J")  # clear leftovers below if this frame is shorter
         sys.stdout.flush()
+    print("------------------------")
 
 
 if __name__ == "__main__":
