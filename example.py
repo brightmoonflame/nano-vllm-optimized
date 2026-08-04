@@ -5,6 +5,16 @@ import unicodedata
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+# Special tokens appended by the chat template / produced at end-of-turn.
+# Stripping them only affects this demo's display, not engine output.
+SPECIAL_TOKENS = ("<|im_start|>", "<|im_end|>")
+
+
+def strip_special(text: str) -> str:
+    for token in SPECIAL_TOKENS:
+        text = text.replace(token, "")
+    return text
+
 
 def display_width(text: str) -> int:
     """Terminal column width of a line (CJK chars and most emoji take 2 columns)."""
@@ -38,7 +48,7 @@ def main():
     frame_lines = 0  # physical terminal lines occupied by the previous frame
 
     for index, delta, _ in llm.generate_stream_text(prompts, sampling_params, use_tqdm=False):
-        texts[index] += delta
+        texts[index] = strip_special(texts[index] + delta)   # strip on full text, handles split tokens
         width = shutil.get_terminal_size().columns
         lines = []
         for i, text in enumerate(texts):
