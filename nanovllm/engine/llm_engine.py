@@ -95,6 +95,30 @@ class LLMEngine:
                 yield index_of[seq_id], new_token_ids, finished
         pbar.close()
 
+    def generate_stream_text(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
+    ):
+        """Yield (prompt_index, text_delta, is_finished) with incremental detokenization.
+
+        Text is decoded from the accumulated token ids so that BPE pieces
+        spanning multiple tokens render correctly; a trailing half-formed
+        character is held back until the remaining tokens arrive.
+        """
+        buffers, emitted = {}, {}
+        for index, new_token_ids, finished in self.generate_stream(prompts, sampling_params, use_tqdm):
+            buf = buffers.setdefault(index, [])
+            buf.extend(new_token_ids)
+            text = self.tokenizer.decode(buf)
+            start = emitted.get(index, 0)
+            delta = text[start:]
+            if not finished and delta.endswith("\ufffd"):
+                delta = delta[:-1]
+            emitted[index] = start + len(delta)
+            yield index, delta, finished
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],

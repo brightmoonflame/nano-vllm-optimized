@@ -1,4 +1,5 @@
 import os
+import sys
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
@@ -21,12 +22,19 @@ def main():
         )
         for prompt in prompts
     ]
-    outputs = llm.generate(prompts, sampling_params)
-
-    for prompt, output in zip(prompts, outputs):
-        print("\n")
-        print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output['text']!r}")
+    # Each request owns one block; on every delta the cursor returns to the top
+    # and both blocks are redrawn in place, like two typewriter-style chat boxes.
+    print("--- Streaming Output ---\n")
+    for i in range(len(prompts)):
+        print(f"[req {i}] \n")
+    texts = [""] * len(prompts)
+    for index, delta, _ in llm.generate_stream_text(prompts, sampling_params, use_tqdm=False):
+        texts[index] += delta
+        frame = ["\x1b[H--- Streaming Output ---\x1b[K\n"]   # cursor home, redraw title
+        for i, text in enumerate(texts):
+            frame.append(f"\n[req {i}] {text}\x1b[K\n")     # \x1b[K clears leftovers on the line
+        sys.stdout.write("".join(frame) + "\x1b[J")          # \x1b[J clears anything below
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

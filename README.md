@@ -85,16 +85,14 @@ Use `/root/model/Qwen3-0.6B` as the `--model` path. If you run files with hard-c
 
 ## Streaming Output
 
-`generate_stream()` yields tokens incrementally after each engine step, while `generate()` still returns full results at once:
+`generate_stream()` yields raw token ids incrementally after each engine step. For ready-to-print text, `generate_stream_text()` wraps it with incremental detokenization (BPE-safe, holds back half-formed characters):
 
 ```python
-buffers = {}
-for index, new_token_ids, is_finished in llm.generate_stream(prompts, sampling_params):
-    buffers.setdefault(index, []).extend(new_token_ids)
-    text = tokenizer.decode(buffers[index])  # then print the delta since the last decode
+for index, text_delta, is_finished in llm.generate_stream_text(prompts, sampling_params):
+    print(f"[req {index}] {text_delta}", flush=True)
 ```
 
-Decode the accumulated token ids (not just the new ones) so that BPE pieces spanning multiple tokens are rendered correctly.
+`generate()` still returns full results at once. Run `python example.py` to see live streaming from two interleaved requests.
 
 ## Serving Benchmark
 
