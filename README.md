@@ -136,7 +136,7 @@ python serving_bench.py \
 
 ### Results
 
-Results below are recorded on each optimization step to track progress. Hardware: Qwen3-0.6B on a single RTX 4090.
+Hardware: Qwen3-0.6B on a single RTX 4090. Streaming output is a capability addition, not a performance optimization; results below confirm it is throughput-neutral.
 
 #### Engine throughput (`bench.py`)
 
@@ -145,8 +145,7 @@ Results below are recorded on each optimization step to track progress. Hardware
 | Version | Total tokens | Total time | Throughput |
 | --- | ---: | ---: | ---: |
 | Baseline | 133966 | 23.61 s | 5674.12 tok/s |
-| + streaming output | 133966 | 23.83 s | 5622.65 tok/s |
-| + dynamo cache limit | 133966 | 23.84 s | 5618.37 tok/s |
+| + streaming output | 133966 | 23.80 s | 5628.70 tok/s |
 
 #### Serving (`serving_bench.py`)
 
@@ -156,10 +155,5 @@ Results below are recorded on each optimization step to track progress. Hardware
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | Baseline | Offline | 5.76 s | 5688.38 tok/s | 1560.51 ms | 27.80 ms | 5091.67 ms |
 | Baseline | Serving (8 req/s) | 36.32 s | 902.21 tok/s | 61.21 ms | 3.89 ms | 555.81 ms |
-| + streaming output | Offline | 5.79 s | 5663.05 tok/s | 1557.26 ms | 28.05 ms | 5119.28 ms |
-| + streaming output | Serving (8 req/s) | 36.32 s | 902.27 tok/s | 59.09 ms | 3.83 ms | 545.77 ms |
-| + dynamo cache limit | Offline | 5.65 s | 5797.83 tok/s | 1617.77 ms | 26.72 ms | 5010.89 ms |
-
-> Note: the baseline was re-measured on the pre-streaming commit (`f4edcbe`) in the same environment. An earlier baseline (6.70 s / 4893.88 tok/s offline) turned out to be an outlier from a degraded run and was replaced. Baseline vs. "+ streaming output" differ by <0.5%, confirming the streaming refactor is regression-free.
->
-> The "+ dynamo cache limit" row raises `torch._dynamo.config.cache_size_limit` to 64 so that warmup, CUDA-graph capture and prefill shapes all keep their compiled kernels instead of silently falling back to eager. The row is from a warm inductor-cache run: a cold process spends its first prefill step on a one-time recompile (~0.5 s, visible as TTFT ≈ 2.2 s), subsequent runs are unaffected.
+| + streaming output | Offline | 5.63 s | 5819.57 tok/s | 1599.96 ms | 26.68 ms | 4988.93 ms |
+| + streaming output | Serving (8 req/s) | 36.31 s | 902.33 tok/s | 63.68 ms | 3.70 ms | 533.90 ms |
