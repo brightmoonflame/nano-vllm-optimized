@@ -23,7 +23,8 @@ class Sampler(nn.Module):
         # Filtering path
         if top_ks is not None:
             # Keep only the top-k logits per row; mask the rest to -inf.
-            k = int(top_ks.max().item())
+            # k stays a tensor to avoid a GPU→CPU sync (graph break) inside @torch.compile.
+            k = top_ks.max()
             vals, idxs = logits.topk(k, dim=-1)
             mask = torch.full_like(logits, float("-inf"))
             mask.scatter_(1, idxs, vals)
