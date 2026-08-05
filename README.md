@@ -7,6 +7,7 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 1. **Installation workflow**: provides a Conda environment, offline matching FlashAttention wheel installation, and ModelScope model download commands.
 2. **`serving_bench.py`**: benchmarks offline engine throughput and serving end-to-end goodput, including TTFT, TPOT, and request latency.
 3. **Streaming output**: `LLM.generate_stream()` yields `(prompt_index, new_token_ids, is_finished)` after each engine step, so callers can consume tokens as soon as they are produced instead of waiting for the whole batch. `generate()` keeps its original behavior as a thin wrapper over the streaming primitive.
+4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
 
 ## Installation
 
@@ -93,6 +94,23 @@ for index, text_delta, is_finished in llm.generate_stream_text(prompts, sampling
 ```
 
 `generate()` still returns full results at once. Run `python example.py` to see live streaming from two interleaved requests.
+
+## Sampling Parameters
+
+`SamplingParams` supports `temperature`, `top_k`, and `top_p`:
+
+```python
+SamplingParams(temperature=0.6, top_p=0.9)              # nucleus sampling
+SamplingParams(temperature=0.6, top_k=50, top_p=0.9)    # top-k then top-p
+```
+
+- `top_k` (default `-1`): keep only the top-k logits; `-1` disables.
+- `top_p` (default `1.0`): keep the smallest set of tokens whose cumulative probability reaches `top_p`; `1.0` disables.
+- When both are disabled, the original full-vocab sampling path is used (no overhead).
+
+With `top_p=0.9` on Qwen3-0.6B, low-probability tail noise is suppressed — e.g. self-introduction responses no longer emit placeholder tokens like `[Your Name]`, and reasoning tasks stay on track instead of drifting toward irrelevant tokens. The trade-off is ~32% higher TPOT due to the full-vocab sort; combining with `top_k=50` first bounds the sort cost.
+
+`serving_bench.py` exposes `--top-k` and `--top-p` for benchmarking different sampling strategies.
 
 ## Serving Benchmark
 
