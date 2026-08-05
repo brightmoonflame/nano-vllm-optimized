@@ -76,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-output-len", type=int, default=1)
     parser.add_argument("--max-output-len", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top-k", type=int, default=-1, help="Top-k filtering (-1 disables, >0 keeps top-k tokens).")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Top-p nucleus sampling (1.0 disables, (0,1) enables).")
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=512)
@@ -261,6 +263,8 @@ def main() -> None:
     sampling_params = [
         SamplingParams(
             temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
             ignore_eos=args.ignore_eos,
             max_tokens=sample_length(prompt_rng, args.min_output_len, args.max_output_len, args.length_distribution),
         )
