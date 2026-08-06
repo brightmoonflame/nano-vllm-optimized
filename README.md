@@ -8,6 +8,27 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 2. **`serving_bench.py`**: benchmarks offline engine throughput and serving end-to-end goodput, including TTFT, TPOT, and request latency.
 3. **Streaming output**: `LLM.generate_stream()` yields `(prompt_index, new_token_ids, is_finished)` after each engine step, so callers can consume tokens as soon as they are produced instead of waiting for the whole batch. `generate()` keeps its original behavior as a thin wrapper over the streaming primitive.
 4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
+5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
+
+## Supported Models
+
+The engine selects the model implementation at runtime via `hf_config.model_type`. Each architecture lives in its own file under `nanovllm/models/` for easy comparison of architectural differences.
+
+| Architecture | `model_type` | File | Status |
+| --- | --- | --- | --- |
+| Qwen3 (dense) | `qwen3` | `models/qwen3.py` | Supported |
+| Qwen2 / Qwen2.5 | `qwen2` | `models/qwen2.py` | Supported |
+
+To add a new architecture, create `models/xxx.py` and register it in the `model_dict` table in `engine/model_runner.py`.
+
+### Reference throughput
+
+Hardware: single RTX 4090, `bench.py` (256 requests, random 100–1024 token inputs/outputs, `ignore_eos=True`).
+
+| Model | Params | Throughput |
+| --- | ---: | ---: |
+| Qwen3-0.6B | 0.6B | ~5700 tok/s |
+| Qwen2.5-0.5B | 0.5B | ~19500 tok/s |
 
 ## Installation
 
