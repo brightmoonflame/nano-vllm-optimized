@@ -18,6 +18,7 @@ The engine selects the model implementation at runtime via `hf_config.model_type
 | --- | --- | --- | --- |
 | Qwen3 (dense) | `qwen3` | `models/qwen3.py` | Supported |
 | Qwen2 / Qwen2.5 | `qwen2` | `models/qwen2.py` | Supported |
+| Llama 3.x | `llama` | `models/llama.py` | Supported |
 
 To add a new architecture, create `models/xxx.py` and register it in the `model_dict` table in `engine/model_runner.py`.
 
@@ -29,6 +30,7 @@ Hardware: single RTX 4090, `bench.py` (256 requests, random 100–1024 token inp
 | --- | ---: | ---: |
 | Qwen3-0.6B | 0.6B | ~5700 tok/s |
 | Qwen2.5-0.5B | 0.5B | ~19500 tok/s |
+| Llama-3.2-1B | 1B | ~10900 tok/s |
 
 ## Installation
 
