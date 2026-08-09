@@ -60,13 +60,13 @@ class LLMEngine:
 
     def step(self):
         if self.config.enable_chunked_prefill:
-            seqs = self.scheduler.schedule_chunked()
+            seqs, seqlen_this_time = self.scheduler.schedule_chunked()
             has_prefill = any(seq.is_prefill for seq in seqs)
             prev_counts = [seq.num_completion_tokens for seq in seqs]
             if has_prefill:
                 # Mixed batch: prefill chunk + decode, walk varlen path.
-                num_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
-                token_ids = self.model_runner.call("run_chunked", seqs)
+                num_prefill = sum(seqlen_this_time[seq.seq_id] for seq in seqs if seq.is_prefill)
+                token_ids = self.model_runner.call("run_chunked", seqs, seqlen_this_time)
                 self.scheduler.postprocess_chunked(seqs, token_ids)
                 num_tokens = num_prefill
             else:

@@ -99,8 +99,9 @@ class Scheduler:
     # above remain unchanged when the flag is off.
     # ------------------------------------------------------------------
 
-    def schedule_chunked(self) -> list[Sequence]:
+    def schedule_chunked(self) -> tuple[list[Sequence], dict[int, int]]:
         scheduled_seqs = []
+        seqlen_this_time: dict[int, int] = {}
         token_budget = self.max_num_batched_tokens
         preempted = False
 
@@ -122,17 +123,21 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 decode_seqs.append(seq)
                 scheduled_seqs.append(seq)
+                seqlen_this_time[seq.seq_id] = 1
                 token_budget -= 1
         self.running.extendleft(reversed(decode_seqs))
 
         # 2. Prefill pass: only when no preemption happened this step (avoids thrashing).
         #    Uses remaining token_budget, capped by prefill_chunk_size per chunk.
+        #    Pop each seq first so we can schedule chunks from multiple requests in one step.
         if not preempted:
+            partial_prefill_seqs = []
             while self.waiting and token_budget > 0 and len(scheduled_seqs) < self.max_num_seqs:
-                seq = self.waiting[0]
+                seq = self.waiting.popleft()
                 if not seq.block_table:
                     num_cached_blocks = self.block_manager.can_allocate(seq)
                     if num_cached_blocks == -1:
+                        self.waiting.appendleft(seq)
                         break
                     self.block_manager.allocate(seq, num_cached_blocks)
                     num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
@@ -143,20 +148,27 @@ class Scheduler:
                 num_new = min(num_tokens, token_budget, self.prefill_chunk_size)
                 num_new = min(num_new, self.max_model_len - 1 - seq.num_cached_tokens)
                 if num_new <= 0:
+                    self.waiting.appendleft(seq)
                     break
 
                 seq.num_scheduled_tokens = num_new
                 seq.is_prefill = True
                 token_budget -= num_new
+                seqlen_this_time[seq.seq_id] = num_new
 
                 if seq.num_cached_tokens + num_new == seq.num_tokens:
                     seq.status = SequenceStatus.RUNNING
-                    self.waiting.popleft()
                     self.running.append(seq)
+                else:
+                    partial_prefill_seqs.append(seq)
                 scheduled_seqs.append(seq)
 
+            # Put unfinished prefill seqs back to the front of waiting.
+            for seq in reversed(partial_prefill_seqs):
+                self.waiting.appendleft(seq)
+
         assert scheduled_seqs
-        return scheduled_seqs
+        return scheduled_seqs, seqlen_this_time
 
     def postprocess_chunked(self, seqs: list[Sequence], token_ids: list[int]):
         for seq, token_id in zip(seqs, token_ids):

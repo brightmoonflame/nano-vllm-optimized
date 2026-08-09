@@ -241,7 +241,7 @@ class ModelRunner:
         reset_context()
         return token_ids
 
-    def prepare_chunked(self, seqs: list[Sequence]):
+    def prepare_chunked(self, seqs: list[Sequence], seqlen_this_time: dict[int, int]):
         """Build a single varlen batch mixing prefill chunks and decode tokens.
 
         Decode tokens are treated as length-1 prefill sequences. All K/V is
@@ -257,9 +257,9 @@ class ModelRunner:
         slot_mapping = []
 
         for seq in seqs:
+            seqlen_q = seqlen_this_time[seq.seq_id]
             if seq.is_prefill:
                 start = seq.num_cached_tokens
-                seqlen_q = seq.num_scheduled_tokens
                 end = start + seqlen_q
                 seqlen_k = end
                 input_ids.extend(seq[start:end])
@@ -278,7 +278,6 @@ class ModelRunner:
                     slot_mapping.extend(range(slot_start, slot_end))
             else:
                 # Decode: 1 new token, K spans full history + new token.
-                seqlen_q = 1
                 seqlen_k = len(seq) + 1
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
@@ -299,8 +298,8 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    def run_chunked(self, seqs: list[Sequence]) -> list[int]:
-        input_ids, positions = self.prepare_chunked(seqs)
+    def run_chunked(self, seqs: list[Sequence], seqlen_this_time: dict[int, int]) -> list[int]:
+        input_ids, positions = self.prepare_chunked(seqs, seqlen_this_time)
         sampling_args = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill=True)
         token_ids = self.sampler(logits, *sampling_args).tolist() if self.rank == 0 else None
