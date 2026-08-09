@@ -25,6 +25,7 @@ model_dict = {
     "qwen2": Qwen2ForCausalLM,
     "llama": LlamaForCausalLM,
     "gemma3": Gemma3ForCausalLM,
+    "gemma3_text": Gemma3ForCausalLM,
 }
 
 
