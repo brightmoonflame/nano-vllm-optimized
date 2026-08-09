@@ -153,7 +153,9 @@ class ModelRunner:
         kv_mb = self.kv_cache.numel() * self.kv_cache.element_size() / 1e6
         if config.kv_quant:
             kv_mb += self.kv_scales.numel() * self.kv_scales.element_size() / 1e6
-        print(f"KV cache: {config.num_kvcache_blocks} blocks, {kv_mb:.1f} MB ({'INT8' if config.kv_quant else 'BF16'})")
+        per_block_mb = kv_mb / config.num_kvcache_blocks
+        dtype_str = 'INT8' if config.kv_quant else 'BF16'
+        print(f"KV cache: {config.num_kvcache_blocks} blocks × {per_block_mb:.1f} MB/block = {kv_mb:.1f} MB ({dtype_str})")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
