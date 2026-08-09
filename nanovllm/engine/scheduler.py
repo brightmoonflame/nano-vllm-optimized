@@ -10,6 +10,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_model_len = config.max_model_len
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.prefill_chunk_size = config.prefill_chunk_size
@@ -100,16 +101,20 @@ class Scheduler:
 
     def schedule_chunked(self) -> list[Sequence]:
         scheduled_seqs = []
+        token_budget = self.max_num_batched_tokens
+        preempted = False
 
         # 1. Decode pass: schedule 1 token for each running seq (non-blocking).
         decode_seqs = []
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+        while self.running and len(scheduled_seqs) < self.max_num_seqs and token_budget > 0:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
+                    preempted = True
                 else:
                     self.preempt(seq)
+                    preempted = True
                     break
             else:
                 seq.num_scheduled_tokens = 1
@@ -117,31 +122,38 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 decode_seqs.append(seq)
                 scheduled_seqs.append(seq)
+                token_budget -= 1
         self.running.extendleft(reversed(decode_seqs))
 
-        # 2. Prefill pass: fill remaining budget with prefill chunks from waiting.
-        remaining = self.prefill_chunk_size
-        while self.waiting and remaining > 0 and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
+        # 2. Prefill pass: only when no preemption happened this step (avoids thrashing).
+        #    Uses remaining token_budget, capped by prefill_chunk_size per chunk.
+        if not preempted:
+            while self.waiting and token_budget > 0 and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.waiting[0]
+                if not seq.block_table:
+                    num_cached_blocks = self.block_manager.can_allocate(seq)
+                    if num_cached_blocks == -1:
+                        break
+                    self.block_manager.allocate(seq, num_cached_blocks)
+                    num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+                else:
+                    num_tokens = seq.num_tokens - seq.num_cached_tokens
+
+                # Cap by: remaining budget, chunk size limit, and max_model_len boundary.
+                num_new = min(num_tokens, token_budget, self.prefill_chunk_size)
+                num_new = min(num_new, self.max_model_len - 1 - seq.num_cached_tokens)
+                if num_new <= 0:
                     break
-                self.block_manager.allocate(seq, num_cached_blocks)
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
 
-            num_new = min(num_tokens, remaining)
-            seq.num_scheduled_tokens = num_new
-            seq.is_prefill = True
-            remaining -= num_new
+                seq.num_scheduled_tokens = num_new
+                seq.is_prefill = True
+                token_budget -= num_new
 
-            if seq.num_cached_tokens + num_new == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
-            scheduled_seqs.append(seq)
+                if seq.num_cached_tokens + num_new == seq.num_tokens:
+                    seq.status = SequenceStatus.RUNNING
+                    self.waiting.popleft()
+                    self.running.append(seq)
+                scheduled_seqs.append(seq)
 
         assert scheduled_seqs
         return scheduled_seqs
