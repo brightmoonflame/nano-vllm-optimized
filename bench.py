@@ -14,8 +14,10 @@ def main():
     path = os.path.expanduser("/root/model/Qwen3-0.6B/")
     # Toggle chunked prefill: set to True to interleave prefill chunks with decode.
     enable_chunked_prefill = False
+    # Toggle INT8 KV cache quantization (~48% memory reduction).
+    kv_quant = False
     llm = LLM(path, enforce_eager=False, max_model_len=4096,
-              enable_chunked_prefill=enable_chunked_prefill)
+              enable_chunked_prefill=enable_chunked_prefill, kv_quant=kv_quant)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]

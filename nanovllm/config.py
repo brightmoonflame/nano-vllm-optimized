@@ -14,6 +14,7 @@ class Config:
     enforce_eager: bool = False
     enable_chunked_prefill: bool = False
     prefill_chunk_size: int = 1024
+    kv_quant: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

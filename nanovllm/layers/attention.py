@@ -5,6 +5,7 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache
 
 
 @triton.jit
@@ -49,6 +50,7 @@ class Attention(nn.Module):
         scale,
         num_kv_heads,
         sliding_window=None,
+        kv_quant=False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -56,13 +58,18 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
+        self.kv_quant = kv_quant
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale = self.v_scale = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            if self.kv_quant:
+                store_kvcache_int8(k, v, k_cache, v_cache, self.k_scale, self.v_scale, context.slot_mapping)
+            else:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         # window_size: (left, right). sliding_window sets left bound; None means global.
         window_size = (self.sliding_window, 0) if self.sliding_window else (-1, -1)
         if context.is_prefill:
@@ -74,7 +81,17 @@ class Attention(nn.Module):
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables,
                                        window_size=window_size)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True, window_size=window_size)
+            if self.kv_quant:
+                # Dequantize INT8 cache to BF16 before flash_attn.
+                # Only dequantize the tokens actually needed by this decode batch.
+                max_ctx = context.context_lens.max().item()
+                k_bf16 = dequant_kvcache(k_cache, self.k_scale, max_ctx)
+                v_bf16 = dequant_kvcache(v_cache, self.v_scale, max_ctx)
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True, window_size=window_size)
+            else:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True, window_size=window_size)
         return o

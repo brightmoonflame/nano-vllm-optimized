@@ -89,6 +89,8 @@ def parse_args() -> argparse.Namespace:
                         help="Enable chunked prefill: interleave prefill chunks with decode in the same step.")
     parser.add_argument("--prefill-chunk-size", type=int, default=1024,
                         help="Number of prefill tokens per chunk when chunked prefill is enabled.")
+    parser.add_argument("--kv-quant", action="store_true",
+                        help="Enable INT8 KV cache quantization (~48%% memory reduction).")
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-json", type=Path, help="Optional path for aggregate and per-request results.")
@@ -246,6 +248,7 @@ def main() -> None:
         enforce_eager=args.enforce_eager,
         enable_chunked_prefill=args.enable_chunked_prefill,
         prefill_chunk_size=args.prefill_chunk_size,
+        kv_quant=args.kv_quant,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
