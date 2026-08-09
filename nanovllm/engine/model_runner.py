@@ -277,8 +277,8 @@ class ModelRunner:
                         slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                     slot_mapping.extend(range(slot_start, slot_end))
             else:
-                # Decode: 1 new token, K spans full history + new token.
-                seqlen_k = len(seq) + 1
+                # Decode: 1 new token (last_token), K spans full history (includes last_token).
+                seqlen_k = len(seq)
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
                 slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
