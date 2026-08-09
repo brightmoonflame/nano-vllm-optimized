@@ -104,7 +104,7 @@ def run_benchmark(path, prompts, sampling_params, enable_chunked_prefill, prefil
           f"p50={statistics.median(ttfts):7.1f} "
           f"p99={sorted(ttfts)[-1]:7.1f}")
     if all_tbts:
-        print(f" TBT (ms):  mean={statistics.mean(all_tbts):7.1f} "
+        print(f" TPOT (ms): mean={statistics.mean(all_tbts):7.1f} "
               f"p50={statistics.median(all_tbts):7.1f} "
               f"p99={sorted(all_tbts)[-1]:7.1f}")
     print()

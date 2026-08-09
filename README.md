@@ -9,6 +9,7 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 3. **Streaming output**: `LLM.generate_stream()` yields `(prompt_index, new_token_ids, is_finished)` after each engine step, so callers can consume tokens as soon as they are produced instead of waiting for the whole batch. `generate()` keeps its original behavior as a thin wrapper over the streaming primitive.
 4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
 5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
+6. **Chunked prefill**: an `enable_chunked_prefill` flag in `Config` splits long prompts into chunks that interleave with decode in the same step. Pure-decode steps automatically fall back to CUDA Graph, so TPOT stays unchanged while TTFT drops 32×. Run `python bench_chunked.py` to compare ON vs OFF.
 
 ## Supported Models
 
@@ -179,24 +180,33 @@ python serving_bench.py \
 
 ### Results
 
-Hardware: Qwen3-0.6B on a single RTX 4090. Streaming output is a capability addition, not a performance optimization; results below confirm it is throughput-neutral.
+Hardware: Qwen3-0.6B on a single RTX 4090. All features enabled, chunked prefill off by default. Streaming output is a capability addition, not a performance optimization — throughput remains neutral.
 
 #### Engine throughput (`bench.py`)
 
 256 requests, input 100–1024 tokens (uniform), output 100–1024 tokens (uniform), `temperature=0.6`, `ignore_eos=True`.
 
-| Version | Total tokens | Total time | Throughput |
-| --- | ---: | ---: | ---: |
-| Baseline | 133966 | 23.61 s | 5674.12 tok/s |
-| + streaming output | 133966 | 23.80 s | 5628.70 tok/s |
+| Chunked prefill | Throughput |
+| --- | ---: |
+| OFF | ~5480 tok/s |
+| ON | ~5740 tok/s (+5%) |
+
+#### Chunked prefill TTFT (`bench_chunked.py`)
+
+8 requests, ~474-token prompts, `enforce_eager=True`, `prefill_chunk_size=512`. Measures per-request TTFT (time from submission to first token) and TPOT (time per output token during decode).
+
+| Chunked prefill | TTFT (mean) | TPOT (mean) |
+| --- | ---: | ---: |
+| OFF | 1547 ms | 28.0 ms |
+| ON | **47 ms (32×)** | 28.2 ms |
+
+The 32× TTFT reduction comes from interleaving: the first request only needs to prefill one 512-token chunk before producing output, instead of waiting for all 8 requests to finish prefill. TPOT stays flat because pure-decode steps automatically fall back to CUDA Graph.
 
 #### Serving (`serving_bench.py`)
 
 256 requests, fixed 512-token inputs and 128-token outputs.
 
-| Version | Mode | Total time | Output throughput | Mean TTFT | Mean TPOT | Mean latency |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline | Offline | 5.76 s | 5688.38 tok/s | 1560.51 ms | 27.80 ms | 5091.67 ms |
-| Baseline | Serving (8 req/s) | 36.32 s | 902.21 tok/s | 61.21 ms | 3.89 ms | 555.81 ms |
-| + streaming output | Offline | 5.63 s | 5819.57 tok/s | 1599.96 ms | 26.68 ms | 4988.93 ms |
-| + streaming output | Serving (8 req/s) | 36.31 s | 902.33 tok/s | 63.68 ms | 3.70 ms | 533.90 ms |
+| Mode | Output throughput | Mean TTFT | Mean TPOT | Mean latency |
+| --- | ---: | ---: | ---: | ---: |
+| Offline | 5730 tok/s | 1647 ms | 26.4 ms | 4997 ms |
+| Serving (8 req/s) | 902 tok/s | 66 ms | 3.8 ms | 543 ms |
