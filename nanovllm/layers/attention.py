@@ -5,7 +5,7 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
-from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache_to_buf
+from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache
 
 
 @triton.jit
@@ -61,9 +61,6 @@ class Attention(nn.Module):
         self.kv_quant = kv_quant
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
-        # Pre-allocated BF16 buffers for dequant (reused across decode steps).
-        self._k_bf16 = None
-        self._v_bf16 = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -85,14 +82,10 @@ class Attention(nn.Module):
                                        window_size=window_size)
         else:    # decode
             if self.kv_quant:
-                # Dequantize full INT8 cache to pre-allocated BF16 buffer.
-                # Buffer is allocated once and reused — avoids per-step allocation/gather/remap.
-                if self._k_bf16 is None or self._k_bf16.shape != k_cache.shape:
-                    self._k_bf16 = torch.empty_like(k_cache, dtype=torch.bfloat16)
-                    self._v_bf16 = torch.empty_like(v_cache, dtype=torch.bfloat16)
-                dequant_kvcache_to_buf(k_cache, self.k_scale, self._k_bf16)
-                dequant_kvcache_to_buf(v_cache, self.v_scale, self._v_bf16)
-                o = flash_attn_with_kvcache(q.unsqueeze(1), self._k_bf16, self._v_bf16,
+                # Dequantize INT8 cache to temporary BF16 tensor (caching allocator reuses memory).
+                k_bf16 = dequant_kvcache(k_cache, self.k_scale)
+                v_bf16 = dequant_kvcache(v_cache, self.v_scale)
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True, window_size=window_size)
             else:
