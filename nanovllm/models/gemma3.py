@@ -169,22 +169,25 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Attention block: norm → attn → post-norm → residual
-        if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # Gemma 3 uses local residuals: each block saves its own input, adds it back after post-norm.
+        # This differs from Qwen3/Llama which use a rolling residual passed across norm calls.
+        # The incoming residual (from the previous layer's MLP output) is already fully resolved,
+        # so we ignore it and manage residuals locally.
+
+        # Attention block: norm → attn → post-norm → add residual
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        # MLP block: norm → mlp → post-norm → residual
+        # MLP block: norm → mlp → post-norm → add residual
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states, residual
+        return hidden_states, None
 
 
 class Gemma3Model(nn.Module):
@@ -209,7 +212,8 @@ class Gemma3Model(nn.Module):
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # Gemma3DecoderLayer returns residual=None (local residuals already resolved).
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
