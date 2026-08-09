@@ -82,11 +82,9 @@ class Attention(nn.Module):
                                        window_size=window_size)
         else:    # decode
             if self.kv_quant:
-                # Dequantize INT8 cache to BF16 before flash_attn.
-                # Only dequantize the tokens actually needed by this decode batch.
-                max_ctx = context.context_lens.max().item()
-                k_bf16 = dequant_kvcache(k_cache, self.k_scale, max_ctx)
-                v_bf16 = dequant_kvcache(v_cache, self.v_scale, max_ctx)
+                # Dequantize full INT8 cache to BF16, then pass to flash_attn.
+                k_bf16 = dequant_kvcache(k_cache, self.k_scale)
+                v_bf16 = dequant_kvcache(v_cache, self.v_scale)
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True, window_size=window_size)
