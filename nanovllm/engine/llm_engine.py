@@ -30,7 +30,17 @@ class LLMEngine:
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+        # Collect all EOS token ids: hf_config.eos_token_id (may be int or list) plus
+        # tokenizer.eos_token_id. They can differ — e.g. Gemma 3 uses <eos> (id=1) in
+        # config but <end_of_turn> (id=106) as the tokenizer's eos_token.
+        eos_ids = set()
+        hf_eos = getattr(config.hf_config, "eos_token_id", None)
+        if isinstance(hf_eos, (list, tuple)):
+            eos_ids.update(hf_eos)
+        elif isinstance(hf_eos, int):
+            eos_ids.add(hf_eos)
+        eos_ids.add(self.tokenizer.eos_token_id)
+        config.eos = eos_ids
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
