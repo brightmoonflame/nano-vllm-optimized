@@ -109,6 +109,7 @@ def run_benchmark(path, prompts, sampling_params, enable_chunked_prefill, prefil
               f"p99={sorted(all_tbts)[-1]:7.1f}")
     print()
 
+    llm.exit()
     del llm
     gc.collect()
     torch.cuda.empty_cache()
