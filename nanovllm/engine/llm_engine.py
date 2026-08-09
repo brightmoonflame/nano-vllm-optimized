@@ -58,6 +58,21 @@ class LLMEngine:
         return seq
 
     def step(self):
+        if self.config.enable_chunked_prefill:
+            seqs = self.scheduler.schedule_chunked()
+            num_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+            num_decode = sum(1 for seq in seqs if not seq.is_prefill)
+            token_ids = self.model_runner.call("run_chunked", seqs)
+            prev_counts = [seq.num_completion_tokens for seq in seqs]
+            self.scheduler.postprocess_chunked(seqs, token_ids)
+            outputs = [
+                (seq.seq_id, seq.completion_token_ids[prev:], seq.is_finished)
+                for seq, prev in zip(seqs, prev_counts)
+                if seq.num_completion_tokens > prev
+            ]
+            num_tokens = num_prefill if num_prefill > 0 else -num_decode
+            return outputs, num_tokens
+
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)

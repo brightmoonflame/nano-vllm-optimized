@@ -85,6 +85,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--enable-chunked-prefill", action="store_true",
+                        help="Enable chunked prefill: interleave prefill chunks with decode in the same step.")
+    parser.add_argument("--prefill-chunk-size", type=int, default=1024,
+                        help="Number of prefill tokens per chunk when chunked prefill is enabled.")
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-json", type=Path, help="Optional path for aggregate and per-request results.")
@@ -240,6 +244,8 @@ def main() -> None:
     llm = LLM(
         model_path,
         enforce_eager=args.enforce_eager,
+        enable_chunked_prefill=args.enable_chunked_prefill,
+        prefill_chunk_size=args.prefill_chunk_size,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
