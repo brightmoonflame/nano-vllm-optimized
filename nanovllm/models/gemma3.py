@@ -202,13 +202,15 @@ class Gemma3Model(nn.Module):
             Gemma3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Gemma scales embeddings by sqrt(hidden_size) — unique to Gemma 1/2/3.
+        self.embed_scale = config.hidden_size ** 0.5
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids) * self.embed_scale
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
