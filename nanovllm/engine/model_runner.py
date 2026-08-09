@@ -149,6 +149,10 @@ class ModelRunner:
                     module.v_scale = self.kv_scales[1, layer_id]
                     module.kv_quant = True
                 layer_id += 1
+        kv_mb = self.kv_cache.numel() * self.kv_cache.element_size() / 1e6
+        if config.kv_quant:
+            kv_mb += self.kv_scales.numel() * self.kv_scales.element_size() / 1e6
+        print(f"KV cache: {config.num_kvcache_blocks} blocks, {kv_mb:.1f} MB ({'INT8' if config.kv_quant else 'BF16'})")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
