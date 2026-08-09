@@ -10,6 +10,7 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
 5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
 6. **Chunked prefill**: an `enable_chunked_prefill` flag in `Config` splits long prompts into chunks that interleave with decode in the same step. Pure-decode steps automatically fall back to CUDA Graph, so TPOT stays unchanged while TTFT drops 32×. Run `python bench_chunked.py` to compare ON vs OFF.
+7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head) symmetric Min-Max scaling. KV cache memory per block drops 48% (29.4 → 15.1 MB/block), doubling the number of concurrent sequences the GPU can hold. Decode requires dequantization, so throughput is lower — this is a memory-for-capacity trade-off for resource-constrained scenarios.
 
 ## Supported Models
 
@@ -201,6 +202,17 @@ Hardware: Qwen3-0.6B on a single RTX 4090. All features enabled, chunked prefill
 | ON | **47 ms (32×)** | 28.2 ms |
 
 The 32× TTFT reduction comes from interleaving: the first request only needs to prefill one 512-token chunk before producing output, instead of waiting for all 8 requests to finish prefill. TPOT stays flat because pure-decode steps automatically fall back to CUDA Graph.
+
+#### INT8 KV cache quantization (`bench.py`)
+
+256 requests, input 100–1024 tokens (uniform), `temperature=0.6`, `ignore_eos=True`. KV cache fills 90% of GPU memory in both cases.
+
+| KV cache | Per-block memory | Blocks | Concurrent capacity | Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 (default) | 29.4 MB | 677 | 1× | ~5470 tok/s |
+| INT8 (`kv_quant=True`) | **15.1 MB (-48%)** | **1314 (+94%)** | **~2×** | ~1165 tok/s |
+
+INT8 quantization halves per-block memory, doubling the number of sequences the GPU can hold. Throughput drops because decode requires dequantization — this is a memory-for-capacity trade-off for resource-constrained scenarios where BF16 would OOM.
 
 #### Serving (`serving_bench.py`)
 
