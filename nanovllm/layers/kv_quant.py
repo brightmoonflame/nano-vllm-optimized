@@ -87,14 +87,16 @@ def dequant_kvcache(
 ) -> torch.Tensor:
     """Dequantize the first *num_tokens* entries of an INT8 paged cache to BF16.
 
+    cache_int8 shape: (num_blocks, block_size, num_kv_heads, head_dim).
     Returns a contiguous BF16 tensor shaped (num_tokens, num_kv_heads, head_dim).
     """
-    # cache_int8 shape: (num_blocks * block_size, num_kv_heads, head_dim) — but we
-    # treat it as a flat (total_slots, num_kv_heads, head_dim) view.
-    total_slots, num_kv_heads, head_dim = cache_int8.shape
+    # Flatten (num_blocks, block_size) → total_slots.
+    cache_flat = cache_int8.reshape(-1, *cache_int8.shape[-2:])
+    scale_flat = scale.reshape(-1, scale.shape[-1])
+    total_slots, num_kv_heads, head_dim = cache_flat.shape
     out = torch.empty((num_tokens, num_kv_heads, head_dim), dtype=torch.bfloat16, device=cache_int8.device)
     dequant_kvcache_kernel[(num_tokens, num_kv_heads)](
-        cache_int8, scale, out,
+        cache_flat, scale_flat, out,
         num_tokens,
         NUM_KV_HEADS=num_kv_heads,
         HEAD_DIM=head_dim,
