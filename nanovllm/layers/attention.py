@@ -82,11 +82,19 @@ class Attention(nn.Module):
                                        window_size=window_size)
         else:    # decode
             if self.kv_quant:
-                # Dequantize full INT8 cache to BF16, then pass to flash_attn.
-                k_bf16 = dequant_kvcache(k_cache, self.k_scale)
-                v_bf16 = dequant_kvcache(v_cache, self.v_scale)
+                # Only dequantize blocks actually referenced by this decode batch,
+                # not the entire cache. This avoids O(total_blocks) work per layer.
+                bt = context.block_tables
+                valid_blocks = bt[bt >= 0].unique()
+                k_bf16 = dequant_kvcache(k_cache[valid_blocks], self.k_scale[valid_blocks])
+                v_bf16 = dequant_kvcache(v_cache[valid_blocks], self.v_scale[valid_blocks])
+                # Remap block_table: old block_id → index in valid_blocks.
+                max_block = bt.max().item()
+                id_map = torch.full((max_block + 1,), -1, dtype=torch.int32, device=bt.device)
+                id_map[valid_blocks] = torch.arange(len(valid_blocks), dtype=torch.int32, device=bt.device)
+                new_bt = id_map[bt]
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
-                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            cache_seqlens=context.context_lens, block_table=new_bt,
                                             softmax_scale=self.scale, causal=True, window_size=window_size)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
