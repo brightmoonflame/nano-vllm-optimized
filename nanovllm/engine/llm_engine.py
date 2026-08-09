@@ -61,17 +61,24 @@ class LLMEngine:
     def step(self):
         if self.config.enable_chunked_prefill:
             seqs = self.scheduler.schedule_chunked()
-            num_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
-            num_decode = sum(1 for seq in seqs if not seq.is_prefill)
-            token_ids = self.model_runner.call("run_chunked", seqs)
+            has_prefill = any(seq.is_prefill for seq in seqs)
             prev_counts = [seq.num_completion_tokens for seq in seqs]
-            self.scheduler.postprocess_chunked(seqs, token_ids)
+            if has_prefill:
+                # Mixed batch: prefill chunk + decode, walk varlen path.
+                num_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+                token_ids = self.model_runner.call("run_chunked", seqs)
+                self.scheduler.postprocess_chunked(seqs, token_ids)
+                num_tokens = num_prefill
+            else:
+                # Pure decode: fall back to CUDA graph path for speed.
+                token_ids = self.model_runner.call("run", seqs, False)
+                self.scheduler.postprocess(seqs, token_ids, False)
+                num_tokens = -len(seqs)
             outputs = [
                 (seq.seq_id, seq.completion_token_ids[prev:], seq.is_finished)
                 for seq, prev in zip(seqs, prev_counts)
                 if seq.num_completion_tokens > prev
             ]
-            num_tokens = num_prefill if num_prefill > 0 else -num_decode
             return outputs, num_tokens
 
         seqs, is_prefill = self.scheduler.schedule()
