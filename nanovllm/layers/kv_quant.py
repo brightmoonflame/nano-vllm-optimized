@@ -103,3 +103,21 @@ def dequant_kvcache(
         HEAD_DIM=head_dim,
     )
     return out
+
+
+def dequant_kvcache_to_buf(
+    cache_int8: torch.Tensor, scale: torch.Tensor,
+    out: torch.Tensor,
+):
+    """Dequantize INT8 cache into a pre-allocated BF16 buffer (no allocation)."""
+    num_blocks, block_size, num_kv_heads, head_dim = cache_int8.shape
+    total_tokens = num_blocks * block_size
+    cache_flat = cache_int8.reshape(total_tokens, num_kv_heads, head_dim)
+    scale_flat = scale.reshape(total_tokens, num_kv_heads)
+    out_flat = out.reshape(total_tokens, num_kv_heads, head_dim)
+    dequant_kvcache_kernel[(total_tokens, num_kv_heads)](
+        cache_flat, scale_flat, out_flat,
+        total_tokens,
+        NUM_KV_HEADS=num_kv_heads,
+        HEAD_DIM=head_dim,
+    )

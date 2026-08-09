@@ -5,7 +5,7 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
-from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache
+from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache_to_buf
 
 
 @triton.jit
@@ -61,6 +61,9 @@ class Attention(nn.Module):
         self.kv_quant = kv_quant
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
+        # Pre-allocated BF16 buffers for dequant (reused across decode steps).
+        self._k_bf16 = None
+        self._v_bf16 = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -82,19 +85,15 @@ class Attention(nn.Module):
                                        window_size=window_size)
         else:    # decode
             if self.kv_quant:
-                # Only dequantize blocks actually referenced by this decode batch,
-                # not the entire cache. This avoids O(total_blocks) work per layer.
-                bt = context.block_tables
-                valid_blocks = bt[bt >= 0].unique()
-                k_bf16 = dequant_kvcache(k_cache[valid_blocks], self.k_scale[valid_blocks])
-                v_bf16 = dequant_kvcache(v_cache[valid_blocks], self.v_scale[valid_blocks])
-                # Remap block_table: old block_id → index in valid_blocks.
-                max_block = bt.max().item()
-                id_map = torch.full((max_block + 1,), -1, dtype=torch.int32, device=bt.device)
-                id_map[valid_blocks] = torch.arange(len(valid_blocks), dtype=torch.int32, device=bt.device)
-                new_bt = id_map[bt]
-                o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
-                                            cache_seqlens=context.context_lens, block_table=new_bt,
+                # Dequantize full INT8 cache to pre-allocated BF16 buffer.
+                # Buffer is allocated once and reused — avoids per-step allocation/gather/remap.
+                if self._k_bf16 is None or self._k_bf16.shape != k_cache.shape:
+                    self._k_bf16 = torch.empty_like(k_cache, dtype=torch.bfloat16)
+                    self._v_bf16 = torch.empty_like(v_cache, dtype=torch.bfloat16)
+                dequant_kvcache_to_buf(k_cache, self.k_scale, self._k_bf16)
+                dequant_kvcache_to_buf(v_cache, self.v_scale, self._v_bf16)
+                o = flash_attn_with_kvcache(q.unsqueeze(1), self._k_bf16, self._v_bf16,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True, window_size=window_size)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
