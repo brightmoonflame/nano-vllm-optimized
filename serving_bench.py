@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--enable-chunked-prefill", action="store_true",
                         help="Enable chunked prefill: interleave prefill chunks with decode in the same step.")
+    parser.add_argument("--enable-prefill-cudagraph", action="store_true",
+                        help="Enable token-bucketed CUDA Graph for single-sequence, non-prefix prefill.")
     parser.add_argument("--prefill-chunk-size", type=int, default=1024,
                         help="Number of prefill tokens per chunk when chunked prefill is enabled.")
     parser.add_argument("--kv-quant", action="store_true",
