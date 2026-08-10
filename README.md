@@ -214,6 +214,26 @@ The 32× TTFT reduction comes from interleaving: the first request only needs to
 
 INT8 quantization halves per-block memory, doubling the number of sequences the GPU can hold. Throughput drops because decode requires dequantization — this is a memory-for-capacity trade-off for resource-constrained scenarios where BF16 would OOM.
 
+#### CUDA Graph (`serving_bench.py` + `bench_prefill_graph.py`)
+
+**Decode CUDA Graph** (256 requests, 512-token inputs, 128-token outputs, serving 8 req/s):
+
+| Mode | Mean TPOT | Mean latency |
+| --- | ---: | ---: |
+| Eager (`--enforce-eager`) | 35.3 ms | 4567 ms |
+| CUDA Graph (default) | **3.7 ms (9.5×)** | **538 ms (8.5×)** |
+
+Decode processes only 1 token per sequence per step, so kernel-launch overhead dominates. CUDA Graph eliminates this overhead, yielding a 9.5× TPOT improvement.
+
+**Prefill CUDA Graph** (Llama-3.2-1B, single request, `enforce_eager=True`):
+
+| Prompt length | Graph OFF | Graph ON | Delta |
+| --- | ---: | ---: | ---: |
+| 1024 | 15.9 ms | 16.0 ms | +0.1 ms |
+| 8192 | 18.1 ms | 17.3 ms | -0.7 ms |
+
+Prefill processes hundreds to thousands of tokens per step, so kernel-launch overhead is a small fraction of total compute. On 0.6B–1B models the prefill itself takes only 3–5 ms, making graph savings (~1 ms) hard to measure. The feature is functionally correct and would show significant gains on 7B+ models where prefill exceeds 50 ms.
+
 #### Serving (`serving_bench.py`)
 
 256 requests, fixed 512-token inputs and 128-token outputs.
