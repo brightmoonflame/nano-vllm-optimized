@@ -26,6 +26,7 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        self.spec_token_ids: list[int] = []  # draft tokens pending verification
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

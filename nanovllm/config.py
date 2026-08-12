@@ -16,6 +16,7 @@ class Config:
     prefill_chunk_size: int = 1024
     enable_prefill_cudagraph: bool = False
     kv_quant: bool = False
+    speculative_config: dict | None = None
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
