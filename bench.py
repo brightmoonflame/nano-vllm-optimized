@@ -6,7 +6,7 @@ from nanovllm import LLM, SamplingParams
 
 def main():
     seed(0)
-    num_seqs = 256
+    num_seqs = 64
     max_input_len = 1024
     max_ouput_len = 1024
 
@@ -27,6 +27,7 @@ def main():
               enable_chunked_prefill=enable_chunked_prefill,
               enable_prefill_cudagraph=enable_prefill_cudagraph,
               kv_quant=kv_quant,
+              gpu_memory_utilization=0.8,
               speculative_config=speculative_config)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
