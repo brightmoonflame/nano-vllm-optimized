@@ -431,18 +431,10 @@ class ModelRunner:
             logits = self.run_model(input_ids, positions, is_prefill)
             if self.rank == 0:
                 # temperature=0 → greedy argmax (bypasses stochastic sampler).
+                # Note: for prefill, ParallelLMHead already extracts only the
+                # last-position logits per seq, so logits is [B, vocab_size].
                 if all(seq.temperature <= 0 for seq in seqs):
-                    if is_prefill:
-                        # Prefill returns logits for ALL positions; only the last
-                        # position of each seq predicts the next token.
-                        last_indices = []
-                        offset = 0
-                        for seq in seqs:
-                            offset += seq.num_scheduled_tokens
-                            last_indices.append(offset - 1)
-                        token_ids = logits[torch.tensor(last_indices, device=logits.device)].argmax(dim=-1).tolist()
-                    else:
-                        token_ids = logits.argmax(dim=-1).tolist()
+                    token_ids = logits.argmax(dim=-1).tolist()
                 else:
                     sampling_args = self.prepare_sample(seqs)
                     token_ids = self.sampler(logits, *sampling_args).tolist()
