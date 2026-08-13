@@ -6,9 +6,9 @@ from nanovllm import LLM, SamplingParams
 
 def main():
     seed(0)
-    num_seqs = 64
-    max_input_len = 1024
-    max_ouput_len = 1024
+    num_seqs = 16
+    max_input_len = 512
+    max_ouput_len = 512
 
     target_path = os.path.expanduser("/root/model/Qwen3-1.7B/")
     draft_path = os.path.expanduser("/root/model/Qwen3-0.6B/")
@@ -23,11 +23,11 @@ def main():
     # Set draft_path=None to disable speculative decoding.
     speculative_config = {"model": draft_path, "num_spec_tokens": 5} if draft_path else None
 
-    llm = LLM(target_path, enforce_eager=False, max_model_len=4096,
+    llm = LLM(target_path, enforce_eager=True, max_model_len=4096,
               enable_chunked_prefill=enable_chunked_prefill,
               enable_prefill_cudagraph=enable_prefill_cudagraph,
               kv_quant=kv_quant,
-              gpu_memory_utilization=0.8,
+              gpu_memory_utilization=0.7,
               speculative_config=speculative_config)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
