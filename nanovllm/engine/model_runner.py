@@ -339,14 +339,10 @@ class ModelRunner:
         if self.rank != 0:
             return None
 
-        # Debug: verify index bounds before indexing
-        print(f"[DEBUG] hidden_states: {hidden_states.shape}, input_ids: {input_ids.shape}")
-        print(f"[DEBUG] logits_indices: len={spec_metadata.logits_indices.numel()}, max={spec_metadata.logits_indices.max().item()}")
+        # Reset prefill flag so ParallelLMHead doesn't extract only last-token
+        # logits — we need logits at all K+1 positions for rejection sampling.
+        set_context(False)
         logits = self.model.compute_logits(hidden_states[spec_metadata.logits_indices])
-        print(f"[DEBUG] logits: {logits.shape}")
-        print(f"[DEBUG] target_logits_indices: len={spec_metadata.target_logits_indices.numel()}, max={spec_metadata.target_logits_indices.max().item()}")
-        print(f"[DEBUG] bonus_logits_indices: len={spec_metadata.bonus_logits_indices.numel()}, max={spec_metadata.bonus_logits_indices.max().item()}")
-        print(f"[DEBUG] num_draft_tokens: {spec_metadata.num_draft_tokens}")
         target_logits = logits[spec_metadata.target_logits_indices]
         bonus_logits = logits[spec_metadata.bonus_logits_indices]
         return self.rejection_sampler(spec_metadata, None, target_logits, bonus_logits)
