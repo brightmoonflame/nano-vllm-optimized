@@ -425,9 +425,16 @@ class ModelRunner:
             token_ids = self.run_spec(seqs)
         else:
             input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-            sampling_args = self.prepare_sample(seqs) if self.rank == 0 else None
             logits = self.run_model(input_ids, positions, is_prefill)
-            token_ids = self.sampler(logits, *sampling_args).tolist() if self.rank == 0 else None
+            if self.rank == 0:
+                # temperature=0 → greedy argmax (bypasses stochastic sampler).
+                if all(seq.temperature <= 0 for seq in seqs):
+                    token_ids = logits.argmax(dim=-1).tolist()
+                else:
+                    sampling_args = self.prepare_sample(seqs)
+                    token_ids = self.sampler(logits, *sampling_args).tolist()
+            else:
+                token_ids = None
         reset_context()
         return token_ids
 
@@ -490,9 +497,15 @@ class ModelRunner:
 
     def run_chunked(self, seqs: list[Sequence], seqlen_this_time: dict[int, int]) -> list[int]:
         input_ids, positions = self.prepare_chunked(seqs, seqlen_this_time)
-        sampling_args = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill=True)
-        token_ids = self.sampler(logits, *sampling_args).tolist() if self.rank == 0 else None
+        if self.rank == 0:
+            if all(seq.temperature <= 0 for seq in seqs):
+                token_ids = logits.argmax(dim=-1).tolist()
+            else:
+                sampling_args = self.prepare_sample(seqs)
+                token_ids = self.sampler(logits, *sampling_args).tolist()
+        else:
+            token_ids = None
         reset_context()
         return token_ids
 
