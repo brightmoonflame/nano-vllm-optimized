@@ -19,8 +19,8 @@ class Proposer:
     def __init__(self, draft_model_path: str, num_spec_tokens: int = 5):
         self.num_spec_tokens = num_spec_tokens
         self.draft_model = AutoModelForCausalLM.from_pretrained(
-            draft_model_path, torch_dtype=torch.bfloat16, device_map="cuda"
-        )
+            draft_model_path, torch_dtype=torch.bfloat16
+        ).to("cuda")
         self.draft_model.eval()
 
     @torch.inference_mode()
