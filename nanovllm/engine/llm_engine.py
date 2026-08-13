@@ -72,10 +72,14 @@ class LLMEngine:
                 self.scheduler.postprocess_chunked(seqs, token_ids)
                 num_tokens = num_prefill
             else:
-                # Pure decode: fall back to CUDA graph path for speed.
+                # Pure decode: spec decode if enabled, else CUDA graph path.
                 token_ids = self.model_runner.call("run", seqs, False)
-                self.scheduler.postprocess(seqs, token_ids, False)
-                num_tokens = -len(seqs)
+                if self.config.speculative_config is not None:
+                    self.scheduler.postprocess_spec(seqs, token_ids)
+                    num_tokens = -sum(seq.num_completion_tokens - prev for seq, prev in zip(seqs, prev_counts))
+                else:
+                    self.scheduler.postprocess(seqs, token_ids, False)
+                    num_tokens = -len(seqs)
             outputs = [
                 (seq.seq_id, seq.completion_token_ids[prev:], seq.is_finished)
                 for seq, prev in zip(seqs, prev_counts)
@@ -84,10 +88,15 @@ class LLMEngine:
             return outputs, num_tokens
 
         seqs, is_prefill = self.scheduler.schedule()
+        use_spec = not is_prefill and self.config.speculative_config is not None
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         prev_counts = [seq.num_completion_tokens for seq in seqs]
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if use_spec:
+            self.scheduler.postprocess_spec(seqs, token_ids)
+            num_tokens = -sum(seq.num_completion_tokens - prev for seq, prev in zip(seqs, prev_counts))
+        else:
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [
             (seq.seq_id, seq.completion_token_ids[prev:], seq.is_finished)
             for seq, prev in zip(seqs, prev_counts)

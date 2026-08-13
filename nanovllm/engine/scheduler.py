@@ -17,6 +17,8 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.speculative_config = config.speculative_config
+        self.num_spec_tokens = self.speculative_config.get("num_spec_tokens", 5) if self.speculative_config else 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -57,18 +59,19 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
+        num_tokens = self.num_spec_tokens + 1 if self.speculative_config else 1
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, num_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
                     break
             else:
-                seq.num_scheduled_tokens = 1
+                seq.num_scheduled_tokens = num_tokens
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq, num_tokens)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
@@ -93,6 +96,32 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
 
+    def postprocess_spec(self, seqs: list[Sequence], token_ids_list: list[list[int]]):
+        """Consume spec-decode output: each seq gets 1..K+1 accepted tokens.
+
+        Accepted = accepted drafts + 1 bonus/recovered token. The hash range
+        covers last_token + accepted drafts (their KV was written correctly),
+        excluding the final bonus/recovered whose KV is absent or stale —
+        it will be written and hashed in the next step.
+        """
+        for seq, accepted_tokens in zip(seqs, token_ids_list):
+            finished = False
+            for token_id in accepted_tokens:
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id in self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    finished = True
+                    break
+            if finished:
+                seq.num_scheduled_tokens = 0
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+            else:
+                seq.num_scheduled_tokens = len(accepted_tokens)
+                self.block_manager.hash_blocks(seq)
+                seq.num_cached_tokens += seq.num_scheduled_tokens
+                seq.num_scheduled_tokens = 0
+
     # ------------------------------------------------------------------
     # Chunked prefill: decode and prefill chunks are scheduled in the same step.
     # Enabled by config.enable_chunked_prefill; the original schedule()/postprocess()
@@ -105,11 +134,15 @@ class Scheduler:
         token_budget = self.max_num_batched_tokens
         preempted = False
 
-        # 1. Decode pass: schedule 1 token for each running seq (non-blocking).
+        # 1. Decode pass: schedule tokens for each running seq (non-blocking).
+        #    With spec decode, blocks are allocated for K+1 positions up front so
+        #    a later pure-decode step can verify drafts; a mixed batch still runs
+        #    single-token decode (spec not supported there).
+        num_decode_tokens = self.num_spec_tokens + 1 if self.speculative_config else 1
         decode_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs and token_budget > 0:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, num_decode_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                     preempted = True
@@ -118,9 +151,9 @@ class Scheduler:
                     preempted = True
                     break
             else:
-                seq.num_scheduled_tokens = 1
+                seq.num_scheduled_tokens = num_decode_tokens
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq, num_decode_tokens)
                 decode_seqs.append(seq)
                 scheduled_seqs.append(seq)
                 seqlen_this_time[seq.seq_id] = 1
@@ -166,6 +199,12 @@ class Scheduler:
             # Put unfinished prefill seqs back to the front of waiting.
             for seq in reversed(partial_prefill_seqs):
                 self.waiting.appendleft(seq)
+
+        # Mixed batch: run_chunked processes decode seqs as single-token, so
+        # num_scheduled_tokens must reflect what actually runs this step.
+        if self.speculative_config is not None and any(seq.is_prefill for seq in scheduled_seqs):
+            for seq in decode_seqs:
+                seq.num_scheduled_tokens = 1
 
         assert scheduled_seqs
         return scheduled_seqs, seqlen_this_time

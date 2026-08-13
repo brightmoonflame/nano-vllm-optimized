@@ -100,11 +100,15 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    def can_append(self, seq: Sequence, num_tokens: int = 1) -> bool:
+        """Check if enough free blocks exist for num_tokens new tokens."""
+        end_block = (len(seq) - 1 + num_tokens + self.block_size - 1) // self.block_size
+        return len(self.free_block_ids) >= end_block - len(seq.block_table)
 
-    def may_append(self, seq: Sequence):
-        if len(seq) % self.block_size == 1:
+    def may_append(self, seq: Sequence, num_tokens: int = 1):
+        """Allocate blocks to cover num_tokens new tokens."""
+        end_block = (len(seq) - 1 + num_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) < end_block:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):

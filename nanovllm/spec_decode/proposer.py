@@ -12,7 +12,8 @@ class Proposer:
     """Draft model proposer.
 
     Loads a small draft model and autoregressively generates K candidate
-    tokens for each request. Uses KV cache for efficient incremental decoding.
+    tokens for each request. All requests are batched into a single forward
+    pass per step (left-padded prefill + K-1 batched decode steps).
     """
 
     def __init__(self, draft_model_path: str, num_spec_tokens: int = 5):
@@ -29,7 +30,7 @@ class Proposer:
         target_hidden_states: torch.Tensor | None = None,
         num_spec_tokens: int | None = None,
     ) -> list[list[int]]:
-        """Generate K draft tokens per request.
+        """Generate K draft tokens per request, batched across all requests.
 
         Args:
             target_token_ids: Token ID sequences per request (current context).
@@ -42,25 +43,49 @@ class Proposer:
             has length K.
         """
         K = num_spec_tokens or self.num_spec_tokens
-        all_draft_ids = []
+        B = len(target_token_ids)
+        device = next(self.draft_model.parameters()).device
 
-        for token_ids in target_token_ids:
-            input_ids = torch.tensor([token_ids], dtype=torch.long, device="cuda")
-            past_key_values = None
-            draft_ids = []
+        # Left-pad to uniform length for batched prefill.
+        max_len = max(len(ids) for ids in target_token_ids)
+        pad_id = getattr(self.draft_model.config, "pad_token_id", 0) or 0
+        input_ids = torch.tensor(
+            [[pad_id] * (max_len - len(ids)) + ids for ids in target_token_ids],
+            dtype=torch.long, device=device,
+        )
+        attention_mask = torch.tensor(
+            [[0] * (max_len - len(ids)) + [1] * len(ids) for ids in target_token_ids],
+            dtype=torch.long, device=device,
+        )
+        position_ids = attention_mask.cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
 
-            for _ in range(K):
-                outputs = self.draft_model(
-                    input_ids=input_ids if past_key_values is None else input_ids[:, -1:],
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                # Greedy sampling: argmax of last position logits.
-                next_token = outputs.logits[:, -1, :].argmax(dim=-1).item()
-                draft_ids.append(next_token)
-                past_key_values = outputs.past_key_values
-                input_ids = torch.tensor([[next_token]], dtype=torch.long, device="cuda")
+        # Batched prefill: one forward for all seqs.
+        outputs = self.draft_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
 
-            all_draft_ids.append(draft_ids)
+        # Collect K draft tokens as [B] tensors, one per step.
+        draft_steps = [outputs.logits[:, -1, :].argmax(dim=-1)]
 
-        return all_draft_ids
+        for _ in range(K - 1):
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones(B, 1, dtype=torch.long, device=device),
+            ], dim=1)
+            outputs = self.draft_model(
+                input_ids=draft_steps[-1].unsqueeze(-1),
+                attention_mask=attention_mask,
+                position_ids=attention_mask.sum(dim=1, keepdim=True) - 1,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            draft_steps.append(outputs.logits[:, -1, :].argmax(dim=-1))
+
+        # Single GPU→CPU sync: [K steps, B] → [B, K].
+        return torch.stack(draft_steps, dim=1).tolist()

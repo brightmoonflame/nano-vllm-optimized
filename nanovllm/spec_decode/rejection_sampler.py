@@ -13,7 +13,8 @@ class RejectionSampler:
     """Accept/reject draft tokens using target model probabilities.
 
     Supports both greedy (argmax comparison) and probabilistic (ratio-based)
-    modes. Guarantees the final output distribution equals target model sampling.
+    modes. Greedy mode is fully deterministic — every output token equals
+    target argmax, so output is identical to non-speculative greedy decoding.
     """
 
     def __init__(self):
@@ -34,7 +35,7 @@ class RejectionSampler:
             draft_probs: [total_drafts, V] draft model probabilities.
                 None for greedy mode (argmax comparison only).
             target_logits: [total_drafts, V] target model logits at draft
-                verification positions (after temperature/top-k/top-p).
+                verification positions.
             bonus_logits: [num_reqs, V] logits at bonus positions.
 
         Returns:
@@ -44,86 +45,106 @@ class RejectionSampler:
         """
         num_reqs = len(spec_decode_metadata.num_draft_tokens)
         draft_token_ids = spec_decode_metadata.draft_token_ids
-        device = target_logits.device
-
-        # Target probabilities from logits.
-        target_probs = torch.softmax(target_logits, dim=-1)
-
-        # Pre-sample bonus tokens (greedy argmax).
         bonus_token_ids = bonus_logits.argmax(dim=-1)
+
+        if draft_probs is None:
+            return self._greedy(spec_decode_metadata, target_logits, bonus_token_ids)
+        return self._probabilistic(spec_decode_metadata, draft_probs, target_logits, bonus_token_ids)
+
+    def _greedy(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_logits: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+    ) -> list[list[int]]:
+        """Greedy rejection: every output token equals target argmax.
+
+        Only the accepted count per seq varies. No softmax needed since
+        argmax(logits) == argmax(softmax(logits)). All GPU computation is
+        done upfront, then a single batch of .tolist() calls transfers
+        results to CPU — no per-token .item() syncs.
+        """
+        target_argmax = target_logits.argmax(dim=-1)
+        matches = metadata.draft_token_ids == target_argmax
+
+        # Batch GPU→CPU transfer (3 syncs vs B*K before).
+        target_argmax_list = target_argmax.tolist()
+        bonus_list = bonus_token_ids.tolist()
+        matches_list = matches.tolist()
 
         output_token_ids = []
         draft_start = 0
-
-        for req_idx in range(num_reqs):
-            num_drafts = spec_decode_metadata.num_draft_tokens[req_idx]
-            accepted = []
-
+        for req_idx in range(len(metadata.num_draft_tokens)):
+            num_drafts = metadata.num_draft_tokens[req_idx]
             if num_drafts == 0:
-                # No draft tokens — just the bonus token.
-                accepted.append(bonus_token_ids[req_idx].item())
+                output_token_ids.append([bonus_list[req_idx]])
+                continue
+
+            # Find first mismatch position (0-indexed within this seq's drafts).
+            accepted_count = num_drafts
+            for i in range(num_drafts):
+                if not matches_list[draft_start + i]:
+                    accepted_count = i
+                    break
+
+            if accepted_count == num_drafts:
+                # All drafts accepted → drafts + bonus.
+                output_token_ids.append(
+                    target_argmax_list[draft_start:draft_start + num_drafts]
+                    + [bonus_list[req_idx]]
+                )
             else:
-                rejected = False
-                for i in range(num_drafts):
-                    idx = draft_start + i
-                    draft_token = draft_token_ids[idx].item()
+                # Rejected at accepted_count → accepted drafts + recovered.
+                output_token_ids.append(
+                    target_argmax_list[draft_start:draft_start + accepted_count + 1]
+                )
+            draft_start += num_drafts
+        return output_token_ids
 
-                    if draft_probs is None:
-                        # Greedy: accept if target argmax matches draft.
-                        target_argmax = target_probs[idx].argmax().item()
-                        if target_argmax == draft_token:
-                            accepted.append(draft_token)
-                        else:
-                            # Reject: sample from target excluding rejected token.
-                            recovered = self._sample_recovered(
-                                target_probs[idx], draft_token, device
-                            )
-                            accepted.append(recovered)
-                            rejected = True
-                            break
-                    else:
-                        # Probabilistic: accept with min(1, p/q).
-                        draft_prob = draft_probs[idx][draft_token].item()
-                        target_prob = target_probs[idx][draft_token].item()
-                        accept_prob = min(1.0, target_prob / draft_prob) if draft_prob > 0 else 0.0
+    def _probabilistic(
+        self,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor,
+        target_logits: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+    ) -> list[list[int]]:
+        """Probabilistic rejection: ratio-based accept, residual sampling on reject.
 
-                        if torch.rand(1, device=device).item() < accept_prob:
-                            accepted.append(draft_token)
-                        else:
-                            # Reject: residual sampling.
-                            residual = torch.clamp(
-                                target_probs[idx] - draft_probs[idx], min=0
-                            )
-                            recovered = self._sample_from_residual(residual, device)
-                            accepted.append(recovered)
-                            rejected = True
-                            break
+        Guarantees the output distribution equals direct target model sampling.
+        """
+        target_probs = torch.softmax(target_logits, dim=-1)
+        device = target_logits.device
 
-                # All drafts accepted → append bonus token.
-                if not rejected and len(accepted) == num_drafts:
-                    accepted.append(bonus_token_ids[req_idx].item())
+        output_token_ids = []
+        draft_start = 0
+        for req_idx in range(len(metadata.num_draft_tokens)):
+            num_drafts = metadata.num_draft_tokens[req_idx]
+            if num_drafts == 0:
+                output_token_ids.append([bonus_token_ids[req_idx].item()])
+                continue
+
+            accepted = []
+            for i in range(num_drafts):
+                idx = draft_start + i
+                draft_token = metadata.draft_token_ids[idx].item()
+                draft_prob = draft_probs[idx][draft_token].item()
+                target_prob = target_probs[idx][draft_token].item()
+                accept_prob = min(1.0, target_prob / draft_prob) if draft_prob > 0 else 0.0
+
+                if torch.rand(1, device=device).item() < accept_prob:
+                    accepted.append(draft_token)
+                else:
+                    residual = torch.clamp(target_probs[idx] - draft_probs[idx], min=0)
+                    recovered = self._sample_from_residual(residual, device)
+                    accepted.append(recovered)
+                    break
+            else:
+                # All drafts accepted → bonus.
+                accepted.append(bonus_token_ids[req_idx].item())
 
             output_token_ids.append(accepted)
             draft_start += num_drafts
-
         return output_token_ids
-
-    @staticmethod
-    def _sample_recovered(
-        target_probs: torch.Tensor, rejected_token: int, device: torch.device
-    ) -> int:
-        """Sample from target distribution excluding the rejected token.
-
-        Used in greedy mode when no draft probabilities are available.
-        """
-        probs = target_probs.clone()
-        probs[rejected_token] = 0
-        total = probs.sum()
-        if total > 0:
-            probs /= total
-        else:
-            probs = torch.ones_like(probs) / len(probs)
-        return torch.multinomial(probs, 1).item()
 
     @staticmethod
     def _sample_from_residual(residual: torch.Tensor, device: torch.device) -> int:

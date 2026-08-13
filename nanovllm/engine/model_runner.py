@@ -1,4 +1,5 @@
 import pickle
+import numpy as np
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -17,6 +18,9 @@ from nanovllm.models.gemma3 import Gemma3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.spec_decode.metadata import make_spec_decode_metadata
+from nanovllm.spec_decode.proposer import Proposer
+from nanovllm.spec_decode.rejection_sampler import RejectionSampler
 
 # Maps hf_config.model_type to the corresponding model class.
 # New architectures are added here — model code lives in nanovllm/models/.
@@ -57,6 +61,16 @@ class ModelRunner:
                 self.capture_prefill_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+
+        # Draft model is a standalone HF model (not TP-sharded), so only rank 0
+        # proposes + rejection-samples; other ranks only run the target forward.
+        self.speculative_config = config.speculative_config
+        if self.speculative_config is not None and rank == 0:
+            self.proposer = Proposer(
+                self.speculative_config["model"],
+                self.speculative_config.get("num_spec_tokens", 5),
+            )
+            self.rejection_sampler = RejectionSampler()
 
         if self.world_size > 1:
             if rank == 0:
@@ -228,6 +242,108 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_spec_decode(self, seqs: list[Sequence]):
+        """Build a flattened batch for speculative verification.
+
+        Each seq contributes [last_token, draft_0, ..., draft_{K-1}]
+        continuing from its cached context — structurally identical to a
+        prefill chunk, so the same varlen/paged-attention kernel verifies
+        all requests' drafts in one forward pass (causal within the chunk,
+        so draft_i's hidden state depends on draft_0..i-1 as if accepted).
+
+        NOTE: assumes seq.block_table already has enough blocks allocated
+        for the K+1 new positions — scheduler-side multi-token block
+        allocation is a follow-up, not yet implemented.
+        """
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        num_draft_tokens = []
+        for seq in seqs:
+            chunk = [seq.last_token] + seq.spec_token_ids
+            start = len(seq) - 1
+            end = start + len(chunk)
+            input_ids.extend(chunk)
+            positions.extend(range(start, end))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + len(chunk))
+            cu_seqlens_k.append(cu_seqlens_k[-1] + end)
+            max_seqlen_q = max(len(chunk), max_seqlen_q)
+            max_seqlen_k = max(end, max_seqlen_k)
+            num_draft_tokens.append(len(seq.spec_token_ids))
+
+            start_block = start // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size
+            for i in range(start_block, end_block):
+                slot_start = seq.block_table[i] * self.block_size
+                if i == start_block:
+                    slot_start += start % self.block_size
+                if i != end_block - 1:
+                    slot_end = seq.block_table[i] * self.block_size + self.block_size
+                else:
+                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+                slot_mapping.extend(range(slot_start, slot_end))
+
+        block_tables = self.prepare_block_tables(seqs)
+        spec_metadata = make_spec_decode_metadata(
+            np.array(num_draft_tokens, dtype=np.int32),
+            np.array(cu_seqlens_q[1:], dtype=np.int32),
+        )
+        spec_metadata.draft_token_ids = torch.tensor(
+            [t for seq in seqs for t in seq.spec_token_ids], dtype=torch.int64
+        ).cuda(non_blocking=True)
+        spec_metadata.logits_indices = spec_metadata.logits_indices.cuda(non_blocking=True)
+        spec_metadata.target_logits_indices = spec_metadata.target_logits_indices.cuda(non_blocking=True)
+        spec_metadata.bonus_logits_indices = spec_metadata.bonus_logits_indices.cuda(non_blocking=True)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # Always pass block_tables: K/V for the verified chunk is read from paged cache.
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        return input_ids, positions, spec_metadata
+
+    @torch.inference_mode()
+    def run_spec(self, seqs: list[Sequence]) -> list[list[int]] | None:
+        """Draft-propose-then-verify speculative decoding step (greedy-only).
+
+        1. Draft model autoregressively proposes K candidate tokens per seq.
+        2. Target model verifies all candidates for all seqs in one forward pass.
+        3. RejectionSampler compares draft vs. target argmax and decides how
+           many drafts are accepted (+1 bonus token if all are accepted).
+
+        Returns one accepted-token-id list per seq (length 1..K+1), or None
+        on non-zero ranks (sampling only happens on rank 0).
+        """
+        # Only rank 0 owns the draft model. Broadcast the proposals so every
+        # rank builds the identical verification batch — the TP forward is
+        # collective, so all ranks must see the same shapes and token ids.
+        if self.rank == 0:
+            draft_lists = self.proposer.propose([seq.token_ids for seq in seqs])
+        else:
+            draft_lists = None
+        if self.world_size > 1:
+            obj = [draft_lists]
+            dist.broadcast_object_list(obj, src=0)
+            draft_lists = obj[0]
+        for seq, draft_ids in zip(seqs, draft_lists):
+            seq.spec_token_ids = draft_ids
+
+        input_ids, positions, spec_metadata = self.prepare_spec_decode(seqs)
+        hidden_states = self.model(input_ids, positions)
+        if self.rank != 0:
+            return None
+
+        logits = self.model.compute_logits(hidden_states[spec_metadata.logits_indices])
+        target_logits = logits[spec_metadata.target_logits_indices]
+        bonus_logits = logits[spec_metadata.bonus_logits_indices]
+        return self.rejection_sampler(spec_metadata, None, target_logits, bonus_logits)
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -301,11 +417,17 @@ class ModelRunner:
         set_context(False)
         return self.model.compute_logits(graph_vars["outputs"][actual_tokens - 1:actual_tokens])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        sampling_args = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, *sampling_args).tolist() if self.rank == 0 else None
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
+        # Speculative decode is only used for pure-decode steps; each entry in
+        # token_ids becomes a list of accepted tokens instead of a single int —
+        # Scheduler.postprocess needs a matching update to consume it (follow-up).
+        if not is_prefill and self.speculative_config is not None:
+            token_ids = self.run_spec(seqs)
+        else:
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            sampling_args = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, *sampling_args).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 

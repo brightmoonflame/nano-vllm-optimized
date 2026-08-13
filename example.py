@@ -22,11 +22,17 @@ def display_width(text: str) -> int:
 
 
 def main():
-    path = os.path.expanduser("/root/model/Qwen3-0.6B/")
-    tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    target_path = os.path.expanduser("/root/model/Qwen3-1.7B/")
+    draft_path = os.path.expanduser("/root/model/Qwen3-0.6B/")
+    tokenizer = AutoTokenizer.from_pretrained(target_path)
 
-    sampling_params = SamplingParams(temperature=0.6, top_p=0.9, max_tokens=256)
+    # Set draft_path=None to disable speculative decoding.
+    speculative_config = {"model": draft_path, "num_spec_tokens": 5} if draft_path else None
+    llm = LLM(target_path, enforce_eager=True, tensor_parallel_size=1,
+              speculative_config=speculative_config)
+
+    # temperature=0 (greedy) so spec output is identical to non-spec output.
+    sampling_params = SamplingParams(temperature=0, max_tokens=256)
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
