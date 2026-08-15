@@ -6,7 +6,7 @@ from nanovllm import LLM, SamplingParams
 
 def main():
     seed(0)
-    num_seqs = 16
+    num_seqs = 1
     max_input_len = 512
     max_ouput_len = 512
 
