@@ -70,11 +70,30 @@ def main():
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()
     llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
-    t = (time.time() - t)
+    spec_time = time.time() - t
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
-    throughput = total_tokens / t
-    spec_tag = f"spec(K={speculative_config['num_spec_tokens']})" if speculative_config else "no-spec"
-    print(f"[{spec_tag}] Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+    spec_throughput = total_tokens / spec_time
+    print(f"[spec(K={speculative_config['num_spec_tokens']})] Total: {total_tokens}tok, Time: {spec_time:.2f}s, Throughput: {spec_throughput:.2f}tok/s")
+    llm.exit()
+    del llm
+    import gc, torch
+    gc.collect(); torch.cuda.empty_cache()
+
+    # --- Throughput comparison: same batch, spec off ---
+    llm_no_spec = LLM(target_path, enforce_eager=True, max_model_len=4096,
+                      enable_chunked_prefill=enable_chunked_prefill,
+                      enable_prefill_cudagraph=enable_prefill_cudagraph,
+                      kv_quant=kv_quant,
+                      gpu_memory_utilization=0.7,
+                      speculative_config=None)
+    llm_no_spec.generate(["Benchmark: "], SamplingParams())
+    t = time.time()
+    llm_no_spec.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    no_spec_time = time.time() - t
+    no_spec_throughput = total_tokens / no_spec_time
+    print(f"[no-spec            ] Total: {total_tokens}tok, Time: {no_spec_time:.2f}s, Throughput: {no_spec_throughput:.2f}tok/s")
+    print(f"[speedup] {spec_throughput / no_spec_throughput:.2f}x")
+    llm_no_spec.exit()
 
 
 if __name__ == "__main__":
