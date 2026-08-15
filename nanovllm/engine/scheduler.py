@@ -19,6 +19,9 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         self.speculative_config = config.speculative_config
         self.num_spec_tokens = self.speculative_config.get("num_spec_tokens", 5) if self.speculative_config else 0
+        # Seq ids preempted since the last step, drained by llm_engine.step()
+        # to drop their draft-side state (spec decode only).
+        self.preempted_seq_ids: list[int] = []
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -37,7 +40,11 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
+                # Spec decode: force a full-recompute allocation for this request so
+                # the target forward produces aux hidden states for every position —
+                # see BlockManager.can_allocate's docstring for why a prefix-cache
+                # hit would otherwise leave a gap in the draft proposer's KV.
+                num_cached_blocks = self.block_manager.can_allocate(seq, enable_prefix_cache=self.speculative_config is None)
                 if num_cached_blocks == -1:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
@@ -81,6 +88,11 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
+        if self.speculative_config is not None:
+            # Re-prefill re-extends the draft from scratch, so the stale
+            # committed draft KV/aux/draft0 must be dropped — otherwise the
+            # next extend() would append on top of it.
+            self.preempted_seq_ids.append(seq.seq_id)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -99,10 +111,12 @@ class Scheduler:
     def postprocess_spec(self, seqs: list[Sequence], token_ids_list: list[list[int]]):
         """Consume spec-decode output: each seq gets 1..K+1 accepted tokens.
 
-        Accepted = accepted drafts + 1 bonus/recovered token. The hash range
-        covers last_token + accepted drafts (their KV was written correctly),
-        excluding the final bonus/recovered whose KV is absent or stale —
-        it will be written and hashed in the next step.
+        Accepted = accepted drafts + 1 bonus/recovered token. Only the
+        accepted drafts' KV is committed (len(accepted) - 1 rows): the
+        final token's KV was never correctly written — its verify row
+        held a rejected draft (or didn't exist, when all K drafts were
+        accepted). It becomes next round's last_token and its KV is
+        (re)written by the next verify window's row 0.
         """
         for seq, accepted_tokens in zip(seqs, token_ids_list):
             finished = False
@@ -117,7 +131,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
             else:
-                seq.num_scheduled_tokens = len(accepted_tokens)
+                seq.num_scheduled_tokens = len(accepted_tokens) - 1
                 self.block_manager.hash_blocks(seq)
                 seq.num_cached_tokens += seq.num_scheduled_tokens
                 seq.num_scheduled_tokens = 0
@@ -168,7 +182,8 @@ class Scheduler:
             while self.waiting and token_budget > 0 and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.waiting.popleft()
                 if not seq.block_table:
-                    num_cached_blocks = self.block_manager.can_allocate(seq)
+                    # Same prefix-cache opt-out as schedule() above.
+                    num_cached_blocks = self.block_manager.can_allocate(seq, enable_prefix_cache=self.speculative_config is None)
                     if num_cached_blocks == -1:
                         self.waiting.appendleft(seq)
                         break

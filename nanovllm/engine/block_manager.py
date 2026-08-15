@@ -55,19 +55,29 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def can_allocate(self, seq: Sequence, enable_prefix_cache: bool = True) -> int:
+        """Return the number of blocks whose prefix-cache hit can be reused.
+
+        enable_prefix_cache=False forces num_cached_blocks=0 (no hash lookup),
+        so the caller allocates fresh blocks for the whole sequence. Used by
+        the scheduler to opt a request out of cross-request prefix reuse when
+        speculative decoding is on (see Scheduler.schedule/schedule_chunked):
+        the draft proposer's committed KV must cover [0, len(seq)) with no
+        gaps, which a target-side cache hit would otherwise skip over.
+        """
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                break
-            num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
+        if enable_prefix_cache:
+            for i in range(seq.num_blocks - 1):
+                token_ids = seq.block(i)
+                h = self.compute_hash(token_ids, h)
+                block_id = self.hash_to_block_id.get(h, -1)
+                if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                    break
+                num_cached_blocks += 1
+                if block_id in self.used_block_ids:
+                    num_new_blocks -= 1
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks

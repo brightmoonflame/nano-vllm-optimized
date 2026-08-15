@@ -159,17 +159,34 @@ class LlamaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # EAGLE3: concatenated low/mid/high aux hidden states from the last
+        # forward, or None when aux capture was not requested.
+        self._aux_hidden_states = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        aux_layer_ids: list[int] | None = None,
     ) -> torch.Tensor:
+        """aux_layer_ids: 0-indexed layer outputs to expose for EAGLE3
+        (e.g. [1, 13, 24] for Llama-3.2-3B, the SpecForge convention
+        {1, N//2-1, N-4}). None keeps the exact pre-EAGLE3 behavior."""
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux_hidden_states = [] if aux_layer_ids is not None else None
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if aux_hidden_states is not None and i in aux_layer_ids:
+                # Deferred residual: true layer output is hidden + residual.
+                aux_hidden_states.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states is not None:
+            # [num_tokens, num_aux * hidden_size]; ascending layer order
+            # (low→mid→high) matches the fc weight's input layout.
+            self._aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        else:
+            self._aux_hidden_states = None
         return hidden_states
 
 
@@ -196,8 +213,9 @@ class LlamaForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        aux_layer_ids: list[int] | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, aux_layer_ids)
 
     def compute_logits(
         self,

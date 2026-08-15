@@ -60,6 +60,20 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq
 
+    def _drop_spec_state(self, seqs: list[Sequence]):
+        """Free draft-side state for seqs that finished or were preempted
+        this step (spec decode only).
+
+        Finished seqs are done for good; preempted seqs re-prefill from
+        scratch and would otherwise extend on top of stale draft KV.
+        """
+        ids = [seq.seq_id for seq in seqs if seq.is_finished]
+        if self.scheduler.preempted_seq_ids:
+            ids += self.scheduler.preempted_seq_ids
+            self.scheduler.preempted_seq_ids.clear()
+        if ids:
+            self.model_runner.call("drop_proposer_state", ids)
+
     def step(self):
         if self.config.enable_chunked_prefill:
             seqs, seqlen_this_time = self.scheduler.schedule_chunked()
@@ -80,6 +94,8 @@ class LLMEngine:
                 else:
                     self.scheduler.postprocess(seqs, token_ids, False)
                     num_tokens = -len(seqs)
+            if self.config.speculative_config is not None:
+                self._drop_spec_state(seqs)
             outputs = [
                 (seq.seq_id, seq.completion_token_ids[prev:], seq.is_finished)
                 for seq, prev in zip(seqs, prev_counts)
@@ -97,6 +113,8 @@ class LLMEngine:
             num_tokens = -sum(seq.num_completion_tokens - prev for seq, prev in zip(seqs, prev_counts))
         else:
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if self.config.speculative_config is not None:
+            self._drop_spec_state(seqs)
         outputs = [
             (seq.seq_id, seq.completion_token_ids[prev:], seq.is_finished)
             for seq, prev in zip(seqs, prev_counts)

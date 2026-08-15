@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 # Special tokens appended by the chat template / produced at end-of-turn.
 # Stripping them only affects this demo's display, not engine output.
-SPECIAL_TOKENS = ("<|im_start|>", "<|im_end|>")
+SPECIAL_TOKENS = ("<|im_start|>", "<|im_end|>", "<|begin_of_text|>", "<|eot_id|>", "<|end_of_text|>")
 
 
 def strip_special(text: str) -> str:
@@ -22,8 +22,12 @@ def display_width(text: str) -> int:
 
 
 def main():
-    target_path = os.path.expanduser("/root/model/Qwen3-1.7B/")
-    draft_path = os.path.expanduser("/root/model/Qwen3-0.6B/")
+    # EAGLE3 spec decode requires a Llama target (only LlamaModel.forward has
+    # aux_layer_ids support) and a matching EAGLE3 draft checkpoint. The
+    # canonical combo is meta-llama/Llama-3.2-3B-Instruct (target) +
+    # thoughtworks/Llama-3.2-3B-Instruct-Eagle3 (draft).
+    target_path = os.path.expanduser("/root/model/Llama-3.2-3B-Instruct/")
+    draft_path = os.path.expanduser("/root/model/Llama-3.2-3B-Instruct-Eagle3/")
     tokenizer = AutoTokenizer.from_pretrained(target_path)
 
     # Set draft_path=None to disable speculative decoding.

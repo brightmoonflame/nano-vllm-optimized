@@ -52,23 +52,33 @@ class ModelRunner:
         self.model = model_dict[hf_config.model_type](hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # Draft model is a standalone HF model (not TP-sharded), so only rank 0
+        # proposes + rejection-samples; other ranks only run the target forward.
+        self.speculative_config = config.speculative_config
+        # Per-seq (tokens, positions, aux_hidden) awaiting the next run_spec()
+        # round's proposer.extend() call. Populated by prefill
+        # (_stash_prefill_aux) and by run_spec's own verify pass. Initialized
+        # before warmup: warmup runs a prefill forward, which touches this.
+        self._pending_extend: dict[int, tuple[list[int], list[int], torch.Tensor]] = {}
         self.warmup_model()
         self.allocate_kv_cache()
         # KV quant uses dynamic dequant at decode time — incompatible with CUDA graph.
         if not self.enforce_eager and not config.kv_quant:
             self.capture_cudagraph()
-            if config.enable_prefill_cudagraph:
+            # Prefill graphs never pass aux_layer_ids, so they can't produce the
+            # aux hidden states extend() needs — keep prompt prefill on the eager
+            # path whenever spec decode is on rather than teaching the graph
+            # about a second output tensor for a niche combination.
+            if config.enable_prefill_cudagraph and config.speculative_config is None:
                 self.capture_prefill_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        # Draft model is a standalone HF model (not TP-sharded), so only rank 0
-        # proposes + rejection-samples; other ranks only run the target forward.
-        self.speculative_config = config.speculative_config
         if self.speculative_config is not None and rank == 0:
             self.proposer = Proposer(
                 self.speculative_config["model"],
-                self.speculative_config.get("num_spec_tokens", 5),
+                target_model=self.model,
+                num_spec_tokens=self.speculative_config.get("num_spec_tokens", 5),
             )
             self.rejection_sampler = RejectionSampler()
 
@@ -80,6 +90,21 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+
+    def drop_proposer_state(self, seq_ids: list[int]) -> None:
+        """Free a finished/preempted sequence's draft-side state.
+
+        Only rank 0 owns the proposer; spec-off runs never call this, but
+        guard anyway. `_pending_extend` may also have an entry if the seq
+        finished/was preempted between the last verify round's stash and
+        the next round's extend.
+        """
+        proposer = getattr(self, "proposer", None)
+        if proposer is None:
+            return
+        for sid in seq_ids:
+            proposer.drop(sid)
+            self._pending_extend.pop(sid, None)
 
     def exit(self):
         if self.world_size > 1:
@@ -308,6 +333,60 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions, spec_metadata
 
+    def _spec_aux_layer_ids(self) -> list[int] | None:
+        """aux_layer_ids to request from the target forward when spec decode
+        is on. Only rank 0 owns the proposer / consumes the aux states.
+        getattr guard: the proposer is created after warmup_model(), so
+        warmup's prefill forward sees None and skips aux capture."""
+        proposer = getattr(self, "proposer", None)
+        return proposer.aux_layer_ids if proposer is not None else None
+
+    def _target_forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Target forward, requesting aux hidden states when spec is on.
+        Only LlamaForCausalLM.forward accepts the third arg — pass it
+        conditionally so other archs (qwen/gemma) keep working."""
+        aux_ids = self._spec_aux_layer_ids()
+        if aux_ids is not None:
+            return self.model(input_ids, positions, aux_ids)
+        return self.model(input_ids, positions)
+
+    def _stash_verify_aux(self, seqs: list[Sequence], accepted: list[list[int]]) -> None:
+        """Stash this verify round's target aux hidden states for the
+        tokens it just confirmed, keyed by seq — consumed by the next
+        run_spec() round's proposer.extend() call.
+
+        Verify window = [last_token, draft_0, ..., draft_{K-1}] @ positions
+        [start .. start+K]. EAGLE shifted-token pairing (vLLM eagle.py:
+        input_ids shifted by one, positions/hidden_states not): token a_i
+        @ seq position start+1+i pairs with the hidden that *predicted*
+        it, f_{start+i} — exactly window row i. The bonus token (all K
+        accepted, @ start+K+1) pairs with f_{start+K}, the last window
+        row, so no row is ever missing and no padding is needed.
+        """
+        aux = self.model.model._aux_hidden_states
+        if aux is None:
+            return
+        offset = 0
+        for seq, out in zip(seqs, accepted):
+            start = len(seq) - 1
+            rows = aux[offset:offset + len(out)]
+            self._pending_extend[seq.seq_id] = (
+                out, list(range(start, start + len(out))), rows
+            )
+            offset += 1 + len(seq.spec_token_ids)
+
+    def _extend_pending(self, seqs: list[Sequence]) -> None:
+        """Pop every seq's stashed (tokens, positions, aux) — from prefill or
+        the previous verify round — and catch the draft KV up via `extend`.
+
+        Every seq here must have a pending entry: it's either fresh out of
+        prefill (`_stash_prefill_aux`) or continuing decode (`_stash_verify_aux`
+        from the prior round). A missing entry is a lifecycle bug upstream.
+        """
+        seq_ids = [seq.seq_id for seq in seqs]
+        tokens, positions, aux = zip(*(self._pending_extend.pop(sid) for sid in seq_ids))
+        self.proposer.extend(seq_ids, list(tokens), list(positions), list(aux))
+
     @torch.inference_mode()
     def run_spec(self, seqs: list[Sequence]) -> list[list[int]] | None:
         """Draft-propose-then-verify speculative decoding step (greedy-only).
@@ -324,7 +403,8 @@ class ModelRunner:
         # rank builds the identical verification batch — the TP forward is
         # collective, so all ranks must see the same shapes and token ids.
         if self.rank == 0:
-            draft_lists = self.proposer.propose([seq.token_ids for seq in seqs])
+            self._extend_pending(seqs)
+            draft_lists = self.proposer.propose(seqs)
         else:
             draft_lists = None
         if self.world_size > 1:
@@ -335,7 +415,7 @@ class ModelRunner:
             seq.spec_token_ids = draft_ids
 
         input_ids, positions, spec_metadata = self.prepare_spec_decode(seqs)
-        hidden_states = self.model(input_ids, positions)
+        hidden_states = self._target_forward(input_ids, positions)
         if self.rank != 0:
             return None
 
@@ -345,7 +425,9 @@ class ModelRunner:
         logits = self.model.compute_logits(hidden_states[spec_metadata.logits_indices])
         target_logits = logits[spec_metadata.target_logits_indices]
         bonus_logits = logits[spec_metadata.bonus_logits_indices]
-        return self.rejection_sampler(spec_metadata, None, target_logits, bonus_logits)
+        accepted = self.rejection_sampler(spec_metadata, None, target_logits, bonus_logits)
+        self._stash_verify_aux(seqs, accepted)
+        return accepted
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
@@ -362,7 +444,7 @@ class ModelRunner:
         if is_prefill:
             if self._can_replay_prefill_graph(input_ids):
                 return self.run_prefill_cudagraph(input_ids, positions)
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return self.model.compute_logits(self._target_forward(input_ids, positions))
 
         if self.enforce_eager or input_ids.size(0) > 512 or self.config.kv_quant:
             return self.model.compute_logits(self.model(input_ids, positions))
@@ -438,10 +520,69 @@ class ModelRunner:
                 else:
                     sampling_args = self.prepare_sample(seqs)
                     token_ids = self.sampler(logits, *sampling_args).tolist()
+                if is_prefill and self.speculative_config is not None:
+                    # Stash after sampling: the sampled token closes the
+                    # shifted-token pairing for the final chunk (see below).
+                    self._stash_prefill_aux(seqs, token_ids)
             else:
                 token_ids = None
         reset_context()
         return token_ids
+
+    def _stash_prefill_aux(
+        self,
+        seqs: list[Sequence],
+        sampled: list[int],
+        seqlen: dict[int, int] | None = None,
+    ) -> None:
+        """Stash this prefill step's aux hidden states into `_pending_extend`,
+        accumulating across chunks for multi-step prefills — consumed by the
+        first run_spec() round's proposer.extend() call once the seq starts
+        decoding.
+
+        EAGLE shifted-token pairing (vLLM eagle.py: input_ids shifted by
+        one, positions/hidden_states not): the draft row at position p
+        pairs token t_{p+1} with the target hidden f_p that predicted it.
+        So a chunk covering positions [start, start+n) contributes rows
+        (tokens[start+1 .. start+n], positions [start .. start+n-1], aux
+        rows offset..offset+n-1); the final chunk's closing token
+        t_{start+n} is this step's sampled token (passed in via
+        `sampled`, which is why this runs after sampling).
+
+        A chunk starting at position 0 always replaces any stale entry
+        (fresh prefill, or re-prefill after preemption reset
+        num_cached_tokens); later chunks append.
+
+        For mixed prefill+decode batches (prepare_chunked), pass `seqlen`
+        and skip non-prefill seqs — their length-1 step bypasses spec (see
+        Scheduler.schedule_chunked's "spec not supported there" comment),
+        so their `_pending_extend` entry is left untouched and goes stale
+        by one position until the chunked+spec decode-bypass gap is closed
+        (see SPEC_DECODE_PLAN.md).
+        """
+        aux = self.model.model._aux_hidden_states
+        if aux is None:
+            return
+        offset = 0
+        for seq, next_token in zip(seqs, sampled):
+            n = seq.num_scheduled_tokens if seqlen is None else seqlen[seq.seq_id]
+            if seqlen is not None and not seq.is_prefill:
+                offset += n
+                continue
+            start = seq.num_cached_tokens
+            # Shifted by one: the row at position p holds token t_{p+1}.
+            tokens = seq.token_ids[start + 1:start + n + 1]
+            if len(tokens) < n:    # final chunk: t_{start+n} is the sampled token
+                tokens = tokens + [next_token]
+            positions = list(range(start, start + n))
+            rows = aux[offset:offset + n]
+            offset += n
+            prev = self._pending_extend.get(seq.seq_id) if start > 0 else None
+            if prev is not None:
+                tokens = prev[0] + tokens
+                positions = prev[1] + positions
+                rows = torch.cat([prev[2], rows])
+            self._pending_extend[seq.seq_id] = (tokens, positions, rows)
 
     def prepare_chunked(self, seqs: list[Sequence], seqlen_this_time: dict[int, int]):
         """Build a single varlen batch mixing prefill chunks and decode tokens.
@@ -509,6 +650,9 @@ class ModelRunner:
             else:
                 sampling_args = self.prepare_sample(seqs)
                 token_ids = self.sampler(logits, *sampling_args).tolist()
+            if self.speculative_config is not None:
+                # After sampling, same reason as run()'s prefill branch.
+                self._stash_prefill_aux(seqs, token_ids, seqlen_this_time)
         else:
             token_ids = None
         reset_context()
