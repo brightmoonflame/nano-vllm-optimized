@@ -3,13 +3,24 @@ from torch import nn
 import torch.nn.functional as F
 from transformers import LlamaConfig
 
+from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.rotary_embedding import get_rope
 
 
 class Eagle3Attention(nn.Module):
     """Single attention layer whose QKV projections consume
-    cat(input_layernorm(embed), hidden_norm(hidden)) = 2 * hidden_size."""
+    cat(input_layernorm(embed), hidden_norm(hidden)) = 2 * hidden_size.
+
+    Paged attention: identical structure to `models/llama.py`'s
+    `LlamaAttention` — a `layers.attention.Attention` submodule reads/writes
+    KV through the global `context` (see `utils/context.py`), so this class
+    never touches past_key_values/cache_seqlens explicitly. The draft's KV
+    cache tensor (assigned onto `self.attn.k_cache/v_cache` by
+    `ModelRunner.allocate_kv_cache`) is a *separate* tensor from the
+    target's, but indexed by the *same* block ids (`seq.block_table`) — see
+    SPEC_DECODE_PLAN.md 4a.
+    """
 
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
@@ -28,46 +39,24 @@ class Eagle3Attention(nn.Module):
             max_position=config.max_position_embeddings,
             base=getattr(config, "rope_theta", 10000),
         )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            self.num_kv_heads,
+        )
 
     def forward(
         self,
-        positions: torch.Tensor,           # [B, T] absolute positions
-        hidden_states: torch.Tensor,       # [B, T, 2H]
-        past_key_values: tuple[torch.Tensor, torch.Tensor] | None,  # [B, L, n_kv, D], right-padded
-        cache_seqlens: torch.Tensor,       # [B] valid past lengths (<= L)
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        B, T, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(B, T, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(B, T, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(B, T, self.num_kv_heads, self.head_dim)
-        q, k = self.rotary_emb(positions.flatten(), q.view(B * T, self.num_heads, self.head_dim),
-                               k.view(B * T, self.num_kv_heads, self.head_dim))
-        q = q.view(B, T, self.num_heads, self.head_dim)
-        k = k.view(B, T, self.num_kv_heads, self.head_dim)
-
-        L = 0
-        if past_key_values is not None:
-            past_k, past_v = past_key_values
-            L = past_k.size(1)
-            k = torch.cat([past_k, k], dim=1)
-            v = torch.cat([past_v, v], dim=1)
-        new_past = (k, v)
-        S = k.size(1)
-
-        n_rep = self.num_heads // self.num_kv_heads
-        k_exp = k.repeat_interleave(n_rep, dim=2).transpose(1, 2)   # [B, n_heads, S, D]
-        v_exp = v.repeat_interleave(n_rep, dim=2).transpose(1, 2)
-
-        # Past columns [0, L): valid where j < cache_seqlens[b] (right-padded).
-        # New columns [L, L+T): causal within the chunk (j - L <= t).
-        j = torch.arange(S, device=hidden_states.device)
-        t = torch.arange(T, device=hidden_states.device)
-        allowed = (j[None, None, :] < cache_seqlens[:, None, None]) | (
-            (j[None, None, :] >= L) & (j[None, None, :] < L + t[None, :, None] + 1))
-        o = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k_exp, v_exp, attn_mask=allowed[:, None])
-        o = o.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim)
-        return self.o_proj(o), new_past
+        positions: torch.Tensor,      # [N] absolute positions (flat, N = total tokens in batch)
+        hidden_states: torch.Tensor,  # [N, 2H]
+    ) -> torch.Tensor:
+        q = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        q, k = self.rotary_emb(positions, q, k)
+        o = self.attn(q, k, v)
+        return self.o_proj(o.flatten(1, -1))
 
 
 class Eagle3MLP(nn.Module):
@@ -97,19 +86,17 @@ class Eagle3DecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        embeds: torch.Tensor,              # [B, T, H]
-        hidden_states: torch.Tensor,       # [B, T, H] (fc output or own previous aux)
-        past_key_values: tuple[torch.Tensor, torch.Tensor] | None,
-        cache_seqlens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        embeds: torch.Tensor,              # [N, H]
+        hidden_states: torch.Tensor,       # [N, H] (fc output or own previous aux)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.hidden_norm(hidden_states)
         embeds = self.input_layernorm(embeds)
         x = torch.cat([embeds, hidden_states], dim=-1)
-        attn_out, new_past = self.self_attn(positions, x, past_key_values, cache_seqlens)
+        attn_out = self.self_attn(positions, x)
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual, new_past
+        return hidden_states, residual
 
 
 class Eagle3DraftModel(nn.Module):
@@ -121,6 +108,13 @@ class Eagle3DraftModel(nn.Module):
     (assign ``draft.embed_tokens = target.model.embed_tokens``).
     Note: with TP > 1 the shared embedding's forward contains collectives,
     so this rank-0-only draft currently requires TP == 1.
+
+    All batching/paging is expressed via the flat [N, ...] convention (N =
+    total tokens across the batch) plus the global `context` — same style
+    as `models/llama.py` — rather than an explicit [B, T] + past_key_values
+    interface. This lets the caller (`spec_decode/proposer.py`) run a
+    genuine varlen batched forward for `extend()` and a paged single-token
+    decode step for each `propose()` self-chain step.
     """
 
     def __init__(self, config: LlamaConfig) -> None:
@@ -140,26 +134,19 @@ class Eagle3DraftModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,           # [B, T] target-vocab token ids
-        positions: torch.Tensor,           # [B, T] absolute positions
-        hidden_states: torch.Tensor,       # [B, T, 3H] first use of a round / [B, T, H] later steps
-        past_key_values: tuple[torch.Tensor, torch.Tensor] | None = None,
-        cache_seqlens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Returns (normed_hidden [B,T,H], aux_hidden [B,T,H], new_past).
+        input_ids: torch.Tensor,           # [N] target-vocab token ids
+        positions: torch.Tensor,           # [N] absolute positions
+        hidden_states: torch.Tensor,       # [N, 3H] first use of a round / [N, H] later steps
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (normed_hidden [N,H], aux_hidden [N,H]).
         normed_hidden feeds compute_logits; aux_hidden (pre-norm residual) is
         the hidden input for the next draft step."""
-        B = input_ids.size(0)
-        if cache_seqlens is None:
-            assert past_key_values is None
-            cache_seqlens = torch.zeros(B, dtype=torch.int32, device=input_ids.device)
         embeds = self.embed_tokens(input_ids)
         if hidden_states.size(-1) != embeds.size(-1):
             hidden_states = self.fc(hidden_states)
-        hidden_states, residual, new_past = self.midlayer(
-            positions, embeds, hidden_states, past_key_values, cache_seqlens)
+        hidden_states, residual = self.midlayer(positions, embeds, hidden_states)
         normed, aux = self.norm(hidden_states, residual)
-        return normed, aux, new_past
+        return normed, aux
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

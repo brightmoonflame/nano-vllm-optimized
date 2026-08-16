@@ -122,14 +122,15 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 
 | 维度 | vLLM | nano-vllm 现状 | 差距 |
 |------|------|---------------|------|
-| 调度 | 统一 schedule()，无 prefill/decode 分支 | `schedule()` / `schedule_chunked()` 两条路径，`run()` / `run_spec()` 两个入口 | 根本性架构差异 |
-| Draft KV cache | 独立 KV cache group，paged attention | `Proposer._kv` dict，稠密张量 | 需要重构 Eagle3Attention |
-| extend | 不存在 | `extend()` 手动 catch-up，需要跨调用暂存 | 架构差异的下游影响 |
-| propose 接口 | 接收 target_hidden_states 作为参数 | 需要先 extend 再 propose，两步分离 | 接口不对齐 |
+| extend | 不存在 | `extend()` 手动 catch-up，需要跨调用暂存 | 4a 后 draft KV 已分页正确，但 `_pending_extend`/`extend()` 暂时保留未删（见 4a 说明） |
+| propose 接口 | 接收 target_hidden_states 作为参数 | 需要先 extend 再 propose，两步分离 | 接口不对齐（依赖上面一行清理后才能做，4c 未完成部分） |
 | aux hidden | 模型 forward 返回字段，同调用内传递 | 挂在模型上，需手动提取+暂存 | 流通方式不同 |
-| chunked prefill + spec | 天然支持（统一调度） | 混批降级为单 token | 需要统一调度才能解决 |
 | tree attention | 不支持 | 不支持 | 一致，不需要做 |
 | rejection sampling | `RejectionSampler(sampler, config, device)` | `RejectionSampler()` 无参数 | 接口差异 |
+
+> **调度差异已主动保留**：nano-vllm 保留 `schedule()` / `schedule_chunked()` 两条路径的设计，
+> 不对齐 vLLM V1 的统一调度（见阶段三 4b 已删除）。混批中 prefill 行与 spec decode 行
+> 共存时降级为单 token 验证是已知限制，作为架构差异保留，不视为待修复的缺陷。
 
 ---
 
@@ -187,7 +188,7 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 - [x] **2d-1** `model_runner.py` `run_chunked()`: prefill chunk 也传 `aux_layer_ids`，aux hidden 追加到 `_pending_extend`
   - `run_model(..., is_prefill=True)` 内部已统一走 `_spec_aux_layer_ids()`，无需额外改
   - 新增 `_stash_chunked_aux`：只累积 `seq.is_prefill` 的 seq；混批里的 decode seq（`is_prefill=False`）不 stash——它们本轮走的是 plain argmax，没有经过 extend/propose，见下方遗留问题
-  - **遗留问题（对应表格第 105 行"混批降级为单 token"）**：混批中的 decode seq 本轮 token 不经过 extend，其 `_pending_extend` 条目留着上一轮 verify 的旧数据，下次真正进入 `run_spec` 时会比 `len(seq)` 少 1 个位置。当前不修（需要统一调度，见 4b），只在代码注释里标注，不静默掩盖。
+  - **遗留问题**：混批中的 decode seq 本轮 token 不经过 extend，其 `_pending_extend` 条目留着上一轮 verify 的旧数据，下次真正进入 `run_spec` 时会比 `len(seq)` 少 1 个位置。当前不修（需要混批按行 spec 验证，但 nano-vllm 保留双路径调度，不计划做统一调度对齐），只在代码注释里标注，不静默掩盖。
 
 ---
 
@@ -220,13 +221,12 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 
 **目标**：把 nano-vllm 的 spec decode 架构改成和 vLLM 一致。
 
-> **依赖说明（重要）**：本节三个子项（4a / 4b / 4c）中，`4a` 和 `4b` 是**正交的两个重构**，没有强依赖，可独立安排：
+> **依赖说明（重要）**：本节两个子项中 `4c` 依赖 `4a`：
 >
 > - **4a（draft paged attention）**：改 draft 模型侧（`Eagle3Attention` → paged kernel），消除 `extend()`。**收益是架构一致性 + 正确性**（draft KV 与 target 共享 block 空间，draft 也能吃 prefix cache）。做完后调度入口完全不用动。
-> - **4b（统一调度）**：改 scheduler/runner 侧，合并 prefill/decode 分支。**收益是吞吐**（chunked prefill + spec 混批按行验证），不改功能正确性，但**动调度主流程，回归面最大**。
 > - **4c（propose 接口对齐）**：依赖 4a。
 >
-> **建议顺序**：`4a → 4c` 先做（架构一致性核心），`4b` 放最后单独评估（吞吐优化，风险最高，可独立推迟）。
+> **建议顺序**：`4a → 4c`（架构一致性核心）。
 
 ### 4a. Draft 模型接入统一 paged attention
 
@@ -254,35 +254,6 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 - [ ] **4a-6** `model_runner.py`: 删除 `_pending_extend` 暂存机制
   - 不再需要跨调用暂存 aux hidden
 
-### 4b. 统一调度（可推迟到 4c 之后）
-
-> **注意**：本子项会重构调度主流程，回归面最大，收益仅为吞吐（非正确性）。建议在 `4a → 4c` 完成后、作为独立的吞吐优化单独评估是否值得做。
-
-**vLLM 的 schedule() 设计**：不区分 prefill/decode，spec token 挂在 request 上。天然支持 chunked prefill + spec decode 混批。
-
-- [ ] **4b-1** `engine/scheduler.py`: `schedule()` 和 `schedule_chunked()` 合并为统一入口
-  - 参考 vLLM：每个 request 只有 `num_computed_tokens` 和 `num_tokens_with_spec`
-  - 不再有 `has_prefill` 分支判断
-
-- [ ] **4b-2** `engine/scheduler.py`: spec token 通过 `seq.spec_token_ids` 挂在 Sequence 上
-  - Scheduler 输出 `scheduled_spec_decode_tokens: dict[int, list[int]]`
-  - 对齐 vLLM 的 `SchedulerOutput.scheduled_spec_decode_tokens`
-
-- [ ] **4b-3** `engine/scheduler.py`: 删除混批降级规则（`schedule_chunked` 第 205-212 行）
-  - 统一调度后天然支持混批按行粒度验证
-
-- [ ] **4b-4** `engine/model_runner.py`: `run()` / `run_spec()` / `run_chunked()` 合并为统一入口
-  - 参考 vLLM 的 `execute_model()`：一次 forward，然后根据 `spec_decode_metadata` 决定是否走 spec 路径
-
-- [ ] **4b-5** `engine/model_runner.py`: `prepare_chunked()` 和 `prepare_spec_decode()` 合并
-  - 统一按行处理：prefill chunk 行（0 draft）和 decode verify 行（K draft）在同一个 varlen batch 里
-
-- [ ] **4b-6** `engine/llm_engine.py`: `step()` 简化为单次调用
-  - 不再有 `has_prefill` / `use_spec` 分支
-
-- [ ] **4b-7** `engine/scheduler.py`: `postprocess_chunked()` 和 `postprocess_spec()` 合并
-  - 统一按行类型分别处理
-
 ### 4c. Proposer 接口对齐
 
 - [ ] **4c-1** `spec_decode/proposer.py`: `propose()` 签名对齐 vLLM
@@ -309,51 +280,19 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
   - bonus token 从 `bonus_logits` 采样而非 argmax
   - vLLM 对照：`RejectionSampler` 支持 `rejection_sample_method="standard"`
 
-- [ ] **5-2** `aux_layer_ids` 可配置
-  - 从 `speculative_config["aux_layer_ids"]` 读取，而非硬编码 `{1, N//2-1, N-4}`
-  - vLLM 对照：从 draft model config 的 `eagle_config` 读取
+- [x] **5-2** `aux_layer_ids` 可配置
+  - `Proposer.__init__` 新增 `aux_layer_ids` 参数，`model_runner.py` 传入 `self.speculative_config.get("aux_layer_ids")`；未配置时回退到 `{1, N//2-1, N-4}` heuristic
+  - vLLM 对照：从 draft model config 的 `eagle_config` 读取（此处改为显式配置项，语义等价）
 
-- [ ] **5-3** `Sequence.__getstate__/__setstate__` 补全 `spec_token_ids`
-  - TP > 1 时跨进程 pickle/unpickle 需要
+- [x] **5-3** `Sequence.__getstate__/__setstate__` 补全 `spec_token_ids`
+  - TP > 1 时跨进程 pickle/unpickle 需要；当前流程里 `run_spec` 在 broadcast 后立即覆写 `spec_token_ids`，所以不是活跃 bug，但补全后消除了隐患
 
 - [ ] **5-4** `RejectionSampler` 接口对齐
   - 当前 `RejectionSampler()` 无参数，vLLM 是 `RejectionSampler(sampler, spec_config, device)`
 
 ---
 
-## 6. 阶段五：Tree Attention（可选）
-
-**注意**：vLLM 不支持 tree attention（issue #18327 closed as not planned）。如果严格对齐 vLLM，此项可不做。如果需要，它是阶段三完成后的独立增强。
-
-- [ ] **6-1** `config.py`: `speculative_config` 新增 tree 参数
-  - `tree_mode: bool`, `tree_top_k: int`, `tree_depth: int`, `tree_total_tokens: int`
-
-- [ ] **6-2** `proposer.py`: 新增 `propose_tree()` 方法
-  - top-k 逐层扩展，构建候选树
-  - 返回 `draft_tokens`, `tree_mask`, `tree_position_ids`, `retrieve_indices`
-  - 参考 EAGLE `topK_genrate` 实现
-
-- [ ] **6-3** `sequence.py`: 新增树相关字段
-  - `spec_tree_mask`, `spec_tree_position_ids`, `spec_retrieve_indices`
-
-- [ ] **6-4** `layers/attention.py`: 支持 custom tree mask
-  - tree chunk 节点数少（≤64），用 dense attention + 显式 mask
-  - past KV 仍走 paged cache
-
-- [ ] **6-5** `model_runner.py` `prepare_spec_decode()`: 适配树结构
-  - positions 用 `tree_position_ids`（深度值）
-  - 传递 `tree_mask` 给 attention 层
-
-- [ ] **6-6** `rejection_sampler.py`: 新增树模式
-  - 遍历每条 root-to-leaf 路径（`retrieve_indices`），找最长被接受的前缀
-
-- [ ] **6-7** `metadata.py` + `scheduler.py`: 适配树节点数量
-  - `num_draft_tokens[i] = tree_total_tokens`（而非 K）
-  - block 分配从 K+1 变为 tree_total_tokens+1
-
----
-
-## 7. 依赖关系
+## 6. 依赖关系
 
 ```
 阶段一 (MVP)
@@ -368,25 +307,28 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
   │ 主线：4a (draft paged attention) → 4c (propose 接口对齐)
   │   ├─ 4a 完成后：删除 _pending_extend、extend()、drop()
   │   └─ 4c 依赖 4a，完成后 propose 接口与 vLLM 一致
-  │
-  │ 支线：4b (统一调度) ← 与 4a/4c 正交，可推迟到 4c 之后单独做
-  │   └─ 收益仅吞吐，动调度主流程，回归面最大
   ▼
   ✅ 架构与 vLLM 对齐（4a + 4c）
   │
 阶段四 (功能增强)
   │ 5-1, 5-2, 5-3, 5-4（独立）
   ▼
-阶段五 (可选，按需穿插)
-  ├─ 4b 统一调度：chunked prefill + spec 混批按行验证（吞吐优化）
-  └─ 6 Tree Attention：vLLM 不支持，严格对齐可跳过
-  ▼
   ✅ 完整实现
 ```
 
+> **Tree Attention 已废弃**：vLLM 官方未实现（issue #18327 closed as "not planned"，
+> 90天无活动被 stale bot 自动关闭，无 maintainer 回复，无 linked PR）。原因：
+> (1) PagedAttention block size > 1 与 tree mask 不兼容；(2) 链式 EAGLE3 已有
+> 3x+ 加速，tree 的边际收益有限；(3) 实现维护复杂度高。严格对齐 vLLM 不做此项。
+>
+> **统一调度已废弃**：nano-vllm 保留 `schedule()` / `schedule_chunked()` 双路径设计
+> 与 `run()` / `run_spec()` / `run_chunked()` 三入口，不对齐 vLLM V1 的统一调度。
+> 理由：动调度主流程，回归面最大，收益仅为吞吐（非正确性）。混批中 prefill 行与
+> spec decode 行共存时降级为单 token 验证是已知限制，作为架构差异保留。
+
 ---
 
-## 8. 每阶段验证方式
+## 7. 每阶段验证方式
 
 | 阶段 | 验证方法 |
 |------|----------|
@@ -395,10 +337,8 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 | 2c/2d | `engine.generate(["hello"], ...)` 产出非空文本，不 crash |
 | 3 | 长对话不 OOM；多请求结果正确；被抢占的 seq 恢复后结果正确 |
 | 4a | draft 模型的 KV cache 在 `kv_cache` 显存中；prefix cache 命中时 drafter 状态无缺口 |
-| 4b | chunked prefill 混批时 decode 行仍走 K+1 verify；吞吐不降 |
 | 4c | `propose()` 接口签名与 vLLM 一致 |
 | 5 | temperature=0.7 输出非 greedy 结果 |
-| 6 | tree 模式接受率 > 链式；吞吐提升 |
 
 ---
 

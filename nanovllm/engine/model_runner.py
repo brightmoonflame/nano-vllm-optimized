@@ -61,6 +61,18 @@ class ModelRunner:
         # before warmup: warmup runs a prefill forward, which touches this.
         self._pending_extend: dict[int, tuple[list[int], list[int], torch.Tensor]] = {}
         self.warmup_model()
+        # Must be constructed before allocate_kv_cache(): the draft model's
+        # attention module needs to exist so allocate_kv_cache() can assign
+        # its paged KV cache tensor onto it (same pass as the target's).
+        if self.speculative_config is not None and rank == 0:
+            self.proposer = Proposer(
+                self.speculative_config["model"],
+                target_model=self.model,
+                block_size=self.block_size,
+                num_spec_tokens=self.speculative_config.get("num_spec_tokens", 5),
+                aux_layer_ids=self.speculative_config.get("aux_layer_ids"),
+            )
+            self.rejection_sampler = RejectionSampler()
         self.allocate_kv_cache()
         # KV quant uses dynamic dequant at decode time — incompatible with CUDA graph.
         if not self.enforce_eager and not config.kv_quant:
@@ -73,14 +85,6 @@ class ModelRunner:
                 self.capture_prefill_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
-
-        if self.speculative_config is not None and rank == 0:
-            self.proposer = Proposer(
-                self.speculative_config["model"],
-                target_model=self.model,
-                num_spec_tokens=self.speculative_config.get("num_spec_tokens", 5),
-            )
-            self.rejection_sampler = RejectionSampler()
 
         if self.world_size > 1:
             if rank == 0:
@@ -177,6 +181,18 @@ class ModelRunner:
             # FP32 scale: 2 (k+v) × layers × block_size × num_kv_heads × 4 bytes
             scale_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * 4
             block_bytes += scale_bytes
+
+        # Draft (EAGLE3) KV cache: 1 layer, always full precision (kv_quant
+        # is a target-only optimization here), same num_kvcache_blocks /
+        # block_size as the target so block ids stay directly shareable.
+        proposer = getattr(self, "proposer", None)
+        draft_num_kv_heads = draft_head_dim = None
+        if proposer is not None:
+            draft_config = proposer.draft.config
+            draft_num_kv_heads = getattr(draft_config, "num_key_value_heads", draft_config.num_attention_heads)
+            draft_head_dim = getattr(draft_config, "head_dim", draft_config.hidden_size // draft_config.num_attention_heads)
+            block_bytes += 2 * self.block_size * draft_num_kv_heads * draft_head_dim * hf_config.dtype.itemsize
+
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         cache_dtype = torch.int8 if config.kv_quant else hf_config.dtype
@@ -193,9 +209,20 @@ class ModelRunner:
                     module.v_scale = self.kv_scales[1, layer_id]
                     module.kv_quant = True
                 layer_id += 1
+
+        if proposer is not None:
+            self.draft_kv_cache = torch.empty(
+                2, config.num_kvcache_blocks, self.block_size, draft_num_kv_heads, draft_head_dim, dtype=hf_config.dtype
+            )
+            attn = proposer.draft.midlayer.self_attn.attn
+            attn.k_cache = self.draft_kv_cache[0]
+            attn.v_cache = self.draft_kv_cache[1]
+
         kv_mb = self.kv_cache.numel() * self.kv_cache.element_size() / 1e6
         if config.kv_quant:
             kv_mb += self.kv_scales.numel() * self.kv_scales.element_size() / 1e6
+        if proposer is not None:
+            kv_mb += self.draft_kv_cache.numel() * self.draft_kv_cache.element_size() / 1e6
         per_block_mb = kv_mb / config.num_kvcache_blocks
         dtype_str = 'INT8' if config.kv_quant else 'BF16'
         print(f"KV cache: {config.num_kvcache_blocks} blocks × {per_block_mb:.1f} MB/block = {kv_mb:.1f} MB ({dtype_str})")
@@ -383,9 +410,8 @@ class ModelRunner:
         prefill (`_stash_prefill_aux`) or continuing decode (`_stash_verify_aux`
         from the prior round). A missing entry is a lifecycle bug upstream.
         """
-        seq_ids = [seq.seq_id for seq in seqs]
-        tokens, positions, aux = zip(*(self._pending_extend.pop(sid) for sid in seq_ids))
-        self.proposer.extend(seq_ids, list(tokens), list(positions), list(aux))
+        tokens, positions, aux = zip(*(self._pending_extend.pop(seq.seq_id) for seq in seqs))
+        self.proposer.extend(seqs, list(tokens), list(positions), list(aux))
 
     @torch.inference_mode()
     def run_spec(self, seqs: list[Sequence]) -> list[list[int]] | None:
