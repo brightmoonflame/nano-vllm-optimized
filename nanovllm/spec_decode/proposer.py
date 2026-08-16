@@ -7,11 +7,11 @@ re-running a full draft LM over the whole context every round.
 
 State model
 -----------
-Per-sequence draft state (`_draft_ctx_len` / `_aux` / `_draft0`, keyed by
-`seq.seq_id`) is committed **only** by `extend`, using the target model's
-true aux hidden states. `propose` is read-only: it self-chains K steps
-from the committed state and never commits its own speculative KV to
-`_draft_ctx_len`/`_aux`/`_draft0`.
+Per-sequence draft state (`_draft_ctx_len` / `_aux` / `_draft0_logits`,
+keyed by `seq.seq_id`) is committed **only** by `extend`, using the target
+model's true aux hidden states. `propose` is read-only: it self-chains K
+steps from the committed state and never commits its own speculative KV to
+`_draft_ctx_len`/`_aux`/`_draft0_logits`.
 
 Why propose() never commits its own speculative KV: the K-1 chain steps
 use the draft's own self-predicted hidden states, which are a guess. Once
@@ -118,7 +118,12 @@ class Proposer:
         # needs bookkeeping here.
         self._draft_ctx_len: dict[int, int] = {}
         self._aux: dict[int, torch.Tensor] = {}
-        self._draft0: dict[int, torch.Tensor] = {}
+        # Step-0 draft logits [1, draft_vocab] per seq (the committed
+        # state's prediction for the first chain token). Stored as logits
+        # rather than a decoded token so `propose` can sample from them
+        # for temperature > 0 requests (greedy requests just argmax).
+        self._draft0_logits: dict[int, torch.Tensor] = {}
+        self.target_vocab_size = self.draft.embed_tokens.num_embeddings
 
     def drop(self, seq_id: int) -> None:
         """Free a finished sequence's committed draft state.
@@ -129,7 +134,7 @@ class Proposer:
         """
         self._draft_ctx_len.pop(seq_id, None)
         self._aux.pop(seq_id, None)
-        self._draft0.pop(seq_id, None)
+        self._draft0_logits.pop(seq_id, None)
 
     @torch.inference_mode()
     def extend(
@@ -207,26 +212,29 @@ class Proposer:
         reset_context()
 
         row_ends_t = torch.tensor(row_ends, dtype=torch.long, device=device)
-        draft_id = self.draft.compute_logits(normed[row_ends_t]).argmax(dim=-1)
-        hot_ids = self.hot_token_id[draft_id]
+        last_logits = self.draft.compute_logits(normed[row_ends_t])    # [B, draft_vocab]
         for i, seq in enumerate(seqs):
             sid = seq.seq_id
             self._draft_ctx_len[sid] = positions[i][-1] + 1
             self._aux[sid] = aux_out[row_ends[i]:row_ends[i] + 1]
-            self._draft0[sid] = hot_ids[i:i + 1]
+            self._draft0_logits[sid] = last_logits[i:i + 1]
 
     @torch.inference_mode()
-    def propose(self, seqs: list[Sequence], num_spec_tokens: int | None = None) -> list[list[int]]:
+    def propose(
+        self,
+        seqs: list[Sequence],
+        num_spec_tokens: int | None = None,
+    ) -> tuple[list[list[int]], torch.Tensor | None]:
         """Self-chain K draft tokens per seq from committed state.
 
         Read-only w.r.t. committed state (`_draft_ctx_len`/`_aux`/
-        `_draft0` are never mutated — see module docstring for why), but
-        each chain step *does* write speculative KV into the paged draft
-        cache at the positions it advances through; that write is safe
-        per the module docstring's "paged KV cache" section — it is never
-        read back incorrectly because the next round's `extend` and this
-        round's own verify pass both bound their reads to the true
-        committed/accepted length.
+        `_draft0_logits` are never mutated — see module docstring for
+        why), but each chain step *does* write speculative KV into the
+        paged draft cache at the positions it advances through; that
+        write is safe per the module docstring's "paged KV cache"
+        section — it is never read back incorrectly because the next
+        round's `extend` and this round's own verify pass both bound
+        their reads to the true committed/accepted length.
 
         Requires `extend` to have already been called at least once for
         every seq in `seqs`; committed KV length is always len(seq) - 1
@@ -238,34 +246,63 @@ class Proposer:
         from the padded block-table tensor + current positions entirely
         on-GPU (gather), so there's no host sync inside the K-1 loop.
 
+        Token selection is per seq: greedy seqs (temperature <= 0) take
+        argmax; sampling seqs draw from q = softmax(draft_logits / T)
+        (speculative sampling requires draft tokens ~ q, not argmax, for
+        the output distribution to equal the target's). When any seq
+        samples, each step's q row is also scattered into target-vocab
+        space (zeros outside the draft's hot set) and returned for the
+        rejection sampler's ratio test and residual distribution.
+
         Returns:
-            [B, K] target-vocab token ids, one row per seq.
+            draft_lists: [B, K] target-vocab token ids, one row per seq.
+            draft_probs: [B*K, target_vocab] q rows flattened seq-major
+                (row b*K + i = seq b's i-th draft, matching
+                `SpecDecodeMetadata.draft_token_ids`), or None when every
+                seq is greedy.
         """
         K = num_spec_tokens or self.num_spec_tokens
         device = self.hot_token_id.device
+        B = len(seqs)
+        any_sample = any(seq.temperature > 0 for seq in seqs)
 
         positions = torch.tensor([self._draft_ctx_len[seq.seq_id] for seq in seqs], dtype=torch.long, device=device)
-        token = torch.cat([self._draft0[seq.seq_id] for seq in seqs])                 # [B]
-        aux = torch.cat([self._aux[seq.seq_id] for seq in seqs], dim=0)               # [B, H]
+        aux = torch.cat([self._aux[seq.seq_id] for seq in seqs], dim=0)                 # [B, H]
         block_tables = pad_block_tables([seq.block_table for seq in seqs], device=device)
 
-        draft_steps = [token]
-        for _ in range(K - 1):
-            context_lens = (positions + 1).to(torch.int32)
-            block_idx = (positions // self.block_size).unsqueeze(1)
-            slot_mapping = (
-                block_tables.gather(1, block_idx).squeeze(1).to(torch.int64) * self.block_size
-                + (positions % self.block_size)
-            ).to(torch.int32)
+        if any_sample:
+            temperatures = torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, device=device)
+            greedy_mask = temperatures <= 0
+            # τ=0 rows never read their probs; 1.0 just avoids div-by-zero.
+            temps_col = torch.where(greedy_mask, torch.ones_like(temperatures), temperatures).unsqueeze(1)
+            hot_rows = self.hot_token_id.unsqueeze(0).expand(B, -1)                   # [B, draft_vocab]
 
-            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-            normed, aux_out = self.draft(token, positions, aux)
-            reset_context()
+        # Step 0 consumes the committed state's logits — no forward pass.
+        logits = torch.cat([self._draft0_logits[seq.seq_id] for seq in seqs])         # [B, draft_vocab]
+        draft_steps, prob_steps = [], [] if any_sample else None
+        for step in range(K):
+            if step > 0:
+                context_lens = (positions + 1).to(torch.int32)
+                block_idx = (positions // self.block_size).unsqueeze(1)
+                slot_mapping = (
+                    block_tables.gather(1, block_idx).squeeze(1).to(torch.int64) * self.block_size
+                    + (positions % self.block_size)
+                ).to(torch.int32)
 
-            draft_id = self.draft.compute_logits(normed).argmax(dim=-1)
+                set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+                normed, aux = self.draft(token, positions, aux)
+                reset_context()
+                logits = self.draft.compute_logits(normed)
+                positions = positions + 1
+
+            draft_id = logits.argmax(dim=-1)
+            if any_sample:
+                probs = torch.softmax(logits.float() / temps_col, dim=-1)
+                draft_id = torch.where(greedy_mask, draft_id, torch.multinomial(probs, 1).squeeze(1))
+                full = torch.zeros(B, self.target_vocab_size, dtype=probs.dtype, device=device)
+                prob_steps.append(full.scatter_(1, hot_rows, probs))
             token = self.hot_token_id[draft_id]
-            aux = aux_out
-            positions = positions + 1
             draft_steps.append(token)
 
-        return torch.stack(draft_steps, dim=1).tolist()
+        draft_probs = torch.stack(prob_steps, dim=1).flatten(0, 1) if any_sample else None
+        return torch.stack(draft_steps, dim=1).tolist(), draft_probs

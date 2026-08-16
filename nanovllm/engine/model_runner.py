@@ -67,7 +67,7 @@ class ModelRunner:
                 num_spec_tokens=self.speculative_config.get("num_spec_tokens", 5),
                 aux_layer_ids=self.speculative_config.get("aux_layer_ids"),
             )
-            self.rejection_sampler = RejectionSampler()
+            self.rejection_sampler = RejectionSampler(self.sampler)
         self.allocate_kv_cache()
         # KV quant uses dynamic dequant at decode time — incompatible with CUDA graph.
         if not self.enforce_eager and not config.kv_quant:
@@ -397,12 +397,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_spec(self, seqs: list[Sequence]) -> list[list[int]] | None:
-        """Draft-propose-then-verify speculative decoding step (greedy-only).
+        """Draft-propose-then-verify speculative decoding step.
 
-        1. Draft model autoregressively proposes K candidate tokens per seq.
+        1. Draft model autoregressively proposes K candidate tokens per seq
+           (argmax for greedy seqs, sampled from the draft distribution
+           otherwise).
         2. Target model verifies all candidates for all seqs in one forward pass.
-        3. RejectionSampler compares draft vs. target argmax and decides how
-           many drafts are accepted (+1 bonus token if all are accepted).
+        3. RejectionSampler accepts/rejects per seq — greedy seqs by argmax
+           comparison, sampling seqs by the speculative-sampling ratio test
+           with residual replacement — so output matches non-speculative
+           decoding (greedy: token-for-token; sampling: in distribution).
 
         Returns one accepted-token-id list per seq (length 1..K+1), or None
         on non-zero ranks (sampling only happens on rank 0).
@@ -415,10 +419,11 @@ class ModelRunner:
         # Only rank 0 owns the draft model. Broadcast the proposals so every
         # rank builds the identical verification batch — the TP forward is
         # collective, so all ranks must see the same shapes and token ids.
+        # draft_probs stays rank-0-local: only rank 0 rejection-samples.
         if self.rank == 0:
-            draft_lists = self.proposer.propose(seqs)
+            draft_lists, draft_probs = self.proposer.propose(seqs)
         else:
-            draft_lists = None
+            draft_lists, draft_probs = None, None
         if self.world_size > 1:
             obj = [draft_lists]
             dist.broadcast_object_list(obj, src=0)
@@ -437,7 +442,12 @@ class ModelRunner:
         logits = self.model.compute_logits(hidden_states[spec_metadata.logits_indices])
         target_logits = logits[spec_metadata.target_logits_indices]
         bonus_logits = logits[spec_metadata.bonus_logits_indices]
-        accepted = self.rejection_sampler(spec_metadata, None, target_logits, bonus_logits)
+        accepted = self.rejection_sampler(
+            spec_metadata, draft_probs, target_logits, bonus_logits,
+            [seq.temperature for seq in seqs],
+            [seq.top_k for seq in seqs],
+            [seq.top_p for seq in seqs],
+        )
         self._extend_verify_aux(seqs, accepted)
         return accepted
 

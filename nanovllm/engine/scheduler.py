@@ -90,8 +90,8 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         if self.speculative_config is not None:
             # Re-prefill re-extends the draft from scratch, so the stale
-            # committed draft KV/aux/draft0 must be dropped — otherwise the
-            # next extend() would append on top of it.
+            # committed draft KV/aux/draft0_logits must be dropped —
+            # otherwise the next extend() would append on top of it.
             self.preempted_seq_ids.append(seq.seq_id)
         self.waiting.appendleft(seq)
 

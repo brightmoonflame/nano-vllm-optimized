@@ -277,9 +277,12 @@ EAGLE3 的训练配对（`L_reg = SmoothL1(f_{i+1}, Draft(T_{2:i+1}, F_{1:i}))`�
 
 ## 5. 阶段四：功能增强
 
-- [ ] **5-1** 非 greedy 采样支持
-  - `run_spec` 传 `draft_probs`（draft 侧的 softmax 输出），调 `_probabilistic` 路径
-  - bonus token 从 `bonus_logits` 采样而非 argmax
+- [x] **5-1** 非 greedy 采样支持
+  - `propose()` 按 seq 选 token：greedy（temperature≤0）取 argmax；采样 seq 从 `q = softmax(draft_logits / T)` 中 **multinomial 采样**（投机采样正确性要求 draft token ~ q 而非 argmax）；`extend()` 改存 step-0 logits（`_draft0` → `_draft0_logits`），采样/argmax 推迟到 propose 时按 temperature 决定
+  - 任何 seq 采样时，每步 q 行 scatter 到 target vocab 空间（hot set 之外为 0），以 `draft_probs [B*K, V]`（seq-major 展开，与 `draft_token_ids` 对齐）传给 `run_spec`
+  - `RejectionSampler._probabilistic` 全部向量化：一次过滤 softmax、一次 gather 算 `p(x)/q(x)`、一次 uniform 抽取、一次批量 multinomial 残差采样，然后一批 `.tolist()` 同步；**混批按 req 分流**——greedy req 保持 argmax 验收（其 probs 行被忽略）
+  - bonus token：greedy req argmax；采样 req 复用引擎的 `Sampler`（temperature/top-k/top-p 与非投机路径完全一致）
+  - 目标分布 p 经 `_filtered_probs`（temperature + top-k/top-p 过滤，逐步镜像 `layers/sampler.Sampler`），保证投机采样输出分布 == 非投机采样分布
   - vLLM 对照：`RejectionSampler` 支持 `rejection_sample_method="standard"`
 
 - [x] **5-2** `aux_layer_ids` 可配置
@@ -289,8 +292,9 @@ EAGLE3 的训练配对（`L_reg = SmoothL1(f_{i+1}, Draft(T_{2:i+1}, F_{1:i}))`�
 - [x] **5-3** `Sequence.__getstate__/__setstate__` 补全 `spec_token_ids`
   - TP > 1 时跨进程 pickle/unpickle 需要；当前流程里 `run_spec` 在 broadcast 后立即覆写 `spec_token_ids`，所以不是活跃 bug，但补全后消除了隐患
 
-- [ ] **5-4** `RejectionSampler` 接口对齐
-  - 当前 `RejectionSampler()` 无参数，vLLM 是 `RejectionSampler(sampler, spec_config, device)`
+- [x] **5-4** `RejectionSampler` 接口对齐
+  - 改为 `RejectionSampler(sampler)`——注入引擎的 `Sampler` 用于非 greedy 的 bonus token 采样（5-1 的配套依赖）
+  - 相对 vLLM 的 `(sampler, spec_config, device)` 有意精简：张量自带 device，且本实现没有需要查询的 spec-config 对象
 
 ---
 
@@ -314,7 +318,8 @@ EAGLE3 的训练配对（`L_reg = SmoothL1(f_{i+1}, Draft(T_{2:i+1}, F_{1:i}))`�
   ✅ 4a 完成；extend()/propose() 两步分离是 EAGLE3 双路径调度下的正确形态，非待办
   │
 阶段四 (功能增强)
-  │ 5-1, 5-2, 5-3, 5-4（独立）
+  │ 5-1 (非 greedy 采样) + 5-4 (RejectionSampler 注入 sampler) —— ✅ 已完成
+  │ 5-2 (aux_layer_ids 可配置)、5-3 (Sequence pickle 补全) —— ✅ 已完成
   ▼
   ✅ 完整实现
 ```
@@ -341,7 +346,7 @@ EAGLE3 的训练配对（`L_reg = SmoothL1(f_{i+1}, Draft(T_{2:i+1}, F_{1:i}))`�
 | 3 | 长对话不 OOM；多请求结果正确；被抢占的 seq 恢复后结果正确 |
 | 4a | draft 模型的 KV cache 在 `kv_cache` 显存中；prefix cache 命中时 drafter 状态无缺口 |
 | 4c | `propose()` 接口签名与 vLLM 一致 |
-| 5 | temperature=0.7 输出非 greedy 结果 |
+| 5 | greedy 回归（`bench.py` spec == non-spec）；temperature=0.7 多次运行输出互不相同且不 crash；混批（greedy + 采样）正常 |
 
 ---
 
