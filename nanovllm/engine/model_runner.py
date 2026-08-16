@@ -55,11 +55,6 @@ class ModelRunner:
         # Draft model is a standalone HF model (not TP-sharded), so only rank 0
         # proposes + rejection-samples; other ranks only run the target forward.
         self.speculative_config = config.speculative_config
-        # Per-seq (tokens, positions, aux_hidden) awaiting the next run_spec()
-        # round's proposer.extend() call. Populated by prefill
-        # (_stash_prefill_aux) and by run_spec's own verify pass. Initialized
-        # before warmup: warmup runs a prefill forward, which touches this.
-        self._pending_extend: dict[int, tuple[list[int], list[int], torch.Tensor]] = {}
         self.warmup_model()
         # Must be constructed before allocate_kv_cache(): the draft model's
         # attention module needs to exist so allocate_kv_cache() can assign
@@ -98,17 +93,13 @@ class ModelRunner:
     def drop_proposer_state(self, seq_ids: list[int]) -> None:
         """Free a finished/preempted sequence's draft-side state.
 
-        Only rank 0 owns the proposer; spec-off runs never call this, but
-        guard anyway. `_pending_extend` may also have an entry if the seq
-        finished/was preempted between the last verify round's stash and
-        the next round's extend.
+        Only rank 0 owns the proposer; spec-off runs never call this.
         """
         proposer = getattr(self, "proposer", None)
         if proposer is None:
             return
         for sid in seq_ids:
             proposer.drop(sid)
-            self._pending_extend.pop(sid, None)
 
     def exit(self):
         if self.world_size > 1:
@@ -377,10 +368,11 @@ class ModelRunner:
             return self.model(input_ids, positions, aux_ids)
         return self.model(input_ids, positions)
 
-    def _stash_verify_aux(self, seqs: list[Sequence], accepted: list[list[int]]) -> None:
-        """Stash this verify round's target aux hidden states for the
-        tokens it just confirmed, keyed by seq — consumed by the next
-        run_spec() round's proposer.extend() call.
+    def _extend_verify_aux(self, seqs: list[Sequence], accepted: list[list[int]]) -> None:
+        """Catch the draft up on this verify round's accepted tokens,
+        immediately (no cross-round stash) — using the target's true aux
+        hidden states for the tokens it just confirmed. Called right
+        after rejection sampling, before the next round's `propose`.
 
         Verify window = [last_token, draft_0, ..., draft_{K-1}] @ positions
         [start .. start+K]. EAGLE shifted-token pairing (vLLM eagle.py:
@@ -394,24 +386,14 @@ class ModelRunner:
         if aux is None:
             return
         offset = 0
+        ext_tokens, ext_positions, ext_aux = [], [], []
         for seq, out in zip(seqs, accepted):
             start = len(seq) - 1
-            rows = aux[offset:offset + len(out)]
-            self._pending_extend[seq.seq_id] = (
-                out, list(range(start, start + len(out))), rows
-            )
+            ext_tokens.append(out)
+            ext_positions.append(list(range(start, start + len(out))))
+            ext_aux.append(aux[offset:offset + len(out)])
             offset += 1 + len(seq.spec_token_ids)
-
-    def _extend_pending(self, seqs: list[Sequence]) -> None:
-        """Pop every seq's stashed (tokens, positions, aux) — from prefill or
-        the previous verify round — and catch the draft KV up via `extend`.
-
-        Every seq here must have a pending entry: it's either fresh out of
-        prefill (`_stash_prefill_aux`) or continuing decode (`_stash_verify_aux`
-        from the prior round). A missing entry is a lifecycle bug upstream.
-        """
-        tokens, positions, aux = zip(*(self._pending_extend.pop(seq.seq_id) for seq in seqs))
-        self.proposer.extend(seqs, list(tokens), list(positions), list(aux))
+        self.proposer.extend(seqs, ext_tokens, ext_positions, ext_aux)
 
     @torch.inference_mode()
     def run_spec(self, seqs: list[Sequence]) -> list[list[int]] | None:
@@ -424,12 +406,16 @@ class ModelRunner:
 
         Returns one accepted-token-id list per seq (length 1..K+1), or None
         on non-zero ranks (sampling only happens on rank 0).
+
+        Precondition: `extend` has already been called for every seq in
+        `seqs` — either by the prefill path (`_extend_prefill_aux`, first
+        round) or by the previous round's verify pass
+        (`_extend_verify_aux`, at the end of this same method).
         """
         # Only rank 0 owns the draft model. Broadcast the proposals so every
         # rank builds the identical verification batch — the TP forward is
         # collective, so all ranks must see the same shapes and token ids.
         if self.rank == 0:
-            self._extend_pending(seqs)
             draft_lists = self.proposer.propose(seqs)
         else:
             draft_lists = None
@@ -452,7 +438,7 @@ class ModelRunner:
         target_logits = logits[spec_metadata.target_logits_indices]
         bonus_logits = logits[spec_metadata.bonus_logits_indices]
         accepted = self.rejection_sampler(spec_metadata, None, target_logits, bonus_logits)
-        self._stash_verify_aux(seqs, accepted)
+        self._extend_verify_aux(seqs, accepted)
         return accepted
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -547,24 +533,28 @@ class ModelRunner:
                     sampling_args = self.prepare_sample(seqs)
                     token_ids = self.sampler(logits, *sampling_args).tolist()
                 if is_prefill and self.speculative_config is not None:
-                    # Stash after sampling: the sampled token closes the
+                    # Extend after sampling: the sampled token closes the
                     # shifted-token pairing for the final chunk (see below).
-                    self._stash_prefill_aux(seqs, token_ids)
+                    self._extend_prefill_aux(seqs, token_ids)
             else:
                 token_ids = None
         reset_context()
         return token_ids
 
-    def _stash_prefill_aux(
+    def _extend_prefill_aux(
         self,
         seqs: list[Sequence],
         sampled: list[int],
         seqlen: dict[int, int] | None = None,
     ) -> None:
-        """Stash this prefill step's aux hidden states into `_pending_extend`,
-        accumulating across chunks for multi-step prefills — consumed by the
-        first run_spec() round's proposer.extend() call once the seq starts
-        decoding.
+        """Catch the draft up on this prefill step's newly-produced target
+        aux hidden states immediately (no cross-round stash) — one
+        `proposer.extend()` call per prefill step. For a multi-chunk
+        prefill, each chunk gets its own `extend()` call as soon as its
+        aux hidden states are available; `extend`'s own
+        `assert start == _draft_ctx_len` enforces that successive chunks
+        (and finished-prefill's first decode round) stay contiguous, so no
+        manual cross-call accumulation is needed here.
 
         EAGLE shifted-token pairing (vLLM eagle.py: input_ids shifted by
         one, positions/hidden_states not): the draft row at position p
@@ -575,21 +565,23 @@ class ModelRunner:
         t_{start+n} is this step's sampled token (passed in via
         `sampled`, which is why this runs after sampling).
 
-        A chunk starting at position 0 always replaces any stale entry
-        (fresh prefill, or re-prefill after preemption reset
-        num_cached_tokens); later chunks append.
+        A chunk starting at position 0 (fresh prefill, or re-prefill after
+        preemption reset num_cached_tokens) naturally satisfies `extend`'s
+        continuity assert because preemption drops the seq's stale
+        committed state (`drop_proposer_state` → `Proposer.drop`) before
+        the seq is ever re-scheduled.
 
         For mixed prefill+decode batches (prepare_chunked), pass `seqlen`
         and skip non-prefill seqs — their length-1 step bypasses spec (see
         Scheduler.schedule_chunked's "spec not supported there" comment),
-        so their `_pending_extend` entry is left untouched and goes stale
-        by one position until the chunked+spec decode-bypass gap is closed
-        (see SPEC_DECODE_PLAN.md).
+        so they simply aren't extended this round; their draft state picks
+        up again next time this seq gets a prefill/verify round.
         """
         aux = self.model.model._aux_hidden_states
         if aux is None:
             return
         offset = 0
+        ext_seqs, ext_tokens, ext_positions, ext_aux = [], [], [], []
         for seq, next_token in zip(seqs, sampled):
             n = seq.num_scheduled_tokens if seqlen is None else seqlen[seq.seq_id]
             if seqlen is not None and not seq.is_prefill:
@@ -600,15 +592,13 @@ class ModelRunner:
             tokens = seq.token_ids[start + 1:start + n + 1]
             if len(tokens) < n:    # final chunk: t_{start+n} is the sampled token
                 tokens = tokens + [next_token]
-            positions = list(range(start, start + n))
-            rows = aux[offset:offset + n]
+            ext_seqs.append(seq)
+            ext_tokens.append(tokens)
+            ext_positions.append(list(range(start, start + n)))
+            ext_aux.append(aux[offset:offset + n])
             offset += n
-            prev = self._pending_extend.get(seq.seq_id) if start > 0 else None
-            if prev is not None:
-                tokens = prev[0] + tokens
-                positions = prev[1] + positions
-                rows = torch.cat([prev[2], rows])
-            self._pending_extend[seq.seq_id] = (tokens, positions, rows)
+        if ext_seqs:
+            self.proposer.extend(ext_seqs, ext_tokens, ext_positions, ext_aux)
 
     def prepare_chunked(self, seqs: list[Sequence], seqlen_this_time: dict[int, int]):
         """Build a single varlen batch mixing prefill chunks and decode tokens.
@@ -678,7 +668,7 @@ class ModelRunner:
                 token_ids = self.sampler(logits, *sampling_args).tolist()
             if self.speculative_config is not None:
                 # After sampling, same reason as run()'s prefill branch.
-                self._stash_prefill_aux(seqs, token_ids, seqlen_this_time)
+                self._extend_prefill_aux(seqs, token_ids, seqlen_this_time)
         else:
             token_ids = None
         reset_context()

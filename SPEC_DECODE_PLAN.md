@@ -122,15 +122,25 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 
 | 维度 | vLLM | nano-vllm 现状 | 差距 |
 |------|------|---------------|------|
-| extend | 不存在 | `extend()` 手动 catch-up，需要跨调用暂存 | 4a 后 draft KV 已分页正确，但 `_pending_extend`/`extend()` 暂时保留未删（见 4a 说明） |
-| propose 接口 | 接收 target_hidden_states 作为参数 | 需要先 extend 再 propose，两步分离 | 接口不对齐（依赖上面一行清理后才能做，4c 未完成部分） |
-| aux hidden | 模型 forward 返回字段，同调用内传递 | 挂在模型上，需手动提取+暂存 | 流通方式不同 |
+| extend | 不存在 | `extend()` 手动 catch-up，draft KV 已分页（4a），无跨调用暂存（`_pending_extend` 已删） | **主动保留，非待清理项**——见下方说明 |
+| propose 接口 | 接收 target_hidden_states 作为参数、一步完成 catch-up+自链 | `extend`（消费 verify hidden）+ `propose`（自链）两步分离 | 接口不对齐，但**4c 已废弃**，不再追求合并（见下方说明） |
+| aux hidden | 模型 forward 返回字段，同调用内传递 | 挂在模型上，需手动提取；`extend` 在产生的同一轮内立即消费（无暂存） | 流通方式不同，风险已消除 |
 | tree attention | 不支持 | 不支持 | 一致，不需要做 |
 | rejection sampling | `RejectionSampler(sampler, config, device)` | `RejectionSampler()` 无参数 | 接口差异 |
 
 > **调度差异已主动保留**：nano-vllm 保留 `schedule()` / `schedule_chunked()` 两条路径的设计，
 > 不对齐 vLLM V1 的统一调度（见阶段三 4b 已删除）。混批中 prefill 行与 spec decode 行
 > 共存时降级为单 token 验证是已知限制，作为架构差异保留，不视为待修复的缺陷。
+
+> **`extend`/`propose` 两步分离已主动保留，不是"未完成"**：EAGLE3 论文的训练配对
+> （`L_reg = SmoothL1(f_{i+1}, Draft(T_{2:i+1}, F_{1:i}))`）决定了 draft 预测 `t_{p+1}`
+> 必须用 target 在 position p 的真实 hidden `f_p`，而 `f_p` 只能来自"验证 forward"，
+> 且验证发生在 draft 自链**之前**的轮次——这是算法本身的因果链，不是 nano-vllm 实现的缺陷。
+> vLLM 能把两者合成一次 `propose(target_hidden_states=...)` 调用，前提是统一调度让
+> "补算已确认 token" 和"验证本轮 draft" 合并进同一次 target forward；nano-vllm 保留双路径
+> 调度（未做 4b），所以 `extend`（消费上一轮验证 hidden）与 `propose`（自链）必须是两个
+> 独立步骤。**已做的收敛**是删除 `_pending_extend` 跨轮暂存，让 `extend` 从"下一轮开头消费
+> stash"改为"验证产生 hidden 后立即执行"（见 4a-6），因果顺序不变，只是把多余的中转去掉。
 
 ---
 
@@ -221,55 +231,47 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 
 **目标**：把 nano-vllm 的 spec decode 架构改成和 vLLM 一致。
 
-> **依赖说明（重要）**：本节两个子项中 `4c` 依赖 `4a`：
->
-> - **4a（draft paged attention）**：改 draft 模型侧（`Eagle3Attention` → paged kernel），消除 `extend()`。**收益是架构一致性 + 正确性**（draft KV 与 target 共享 block 空间，draft 也能吃 prefix cache）。做完后调度入口完全不用动。
-> - **4c（propose 接口对齐）**：依赖 4a。
->
-> **建议顺序**：`4a → 4c`（架构一致性核心）。
+> **依赖说明（重要，已更新）**：`4a` 已完成并验证通过；`4c` 已废弃（见下方 4c 小节的理由），不再是
+> "4a 完成后接着做"的下一步。**`extend()` 不会被消除**——EAGLE3 算法本身要求它，详见 4a 小节末尾的说明。
 
 ### 4a. Draft 模型接入统一 paged attention
 
-**vLLM 最核心的架构决策**：draft model 注册在独立 KV cache group，走 paged attention，由 KVCacheManager 统一管理。这消除了 `extend()` 的需求。
+**vLLM 最核心的架构决策**：draft model 注册在独立 KV cache group，走 paged attention，由 KVCacheManager 统一管理。
 
-- [ ] **4a-1** `models/eagle3_draft.py`: `Eagle3Attention` 改为 paged attention
-  - 用项目现有的 paged attention kernel（`flash_attn_with_kvcache` 或等效）
-  - 替代 `F.scaled_dot_product_attention` + 显式 mask
-  - 认识 `block_table`/`slot_mapping`
+**完成情况（已验证）**：`example.py`/`bench.py` 端到端跑通，`temperature=0` 下 `spec == non-spec` 逐 token 一致，`3.53x` 加速。多请求并发（首次 extend + 续接 extend 混合 batch）、preempt 语义均已在改动时逐项推导确认。
 
-- [ ] **4a-2** `model_runner.py` `allocate_kv_cache()`: draft 的 KV 占用 `kv_cache` 显存中的一块（一层）
-  - draft 只有 1 层 transformer，KV cache 大小 = 1 层 target 的量
+- [x] **4a-1** `models/eagle3_draft.py`: `Eagle3Attention` 改为 paged attention
+  - 内部换成项目现有的 `layers.attention.Attention` 子模块，签名从 `(positions, hidden, past_key_values, cache_seqlens)` 简化为 `(positions, hidden_states)`，KV 读写走全局 `context`（`slot_mapping`/`block_tables`/`context_lens`），与 `LlamaAttention` 完全一致
 
-- [ ] **4a-3** `engine/block_manager.py`: hash/allocate 逻辑覆盖 draft 层
-  - draft 和 target 共享 block id 空间
-  - 同一个 block 除了 target 的 K/V 还多存 draft 的 K/V
+- [x] **4a-2** `model_runner.py` `allocate_kv_cache()`: draft 的 KV 占用独立 `draft_kv_cache` 张量（一层）
+  - 与 target `kv_cache` **相同的 `num_kvcache_blocks`/`block_size`**（block id 空间共享的前提），按 draft 自己的 `num_kv_heads`/`head_dim` 计算大小，始终全精度（不受 `kv_quant` 影响）
+  - 挂载到 `proposer.draft.midlayer.self_attn.attn.k_cache/v_cache`；显存统计并入 `allocate_kv_cache` 的日志打印
 
-- [ ] **4a-4** `spec_decode/proposer.py`: 删除 `_kv`/`_aux`/`_draft0` dict 和 `extend()`/`drop()` 方法
-  - draft KV 由 BlockManager 自动管理
-  - 已确认 token 的 draft KV 天然正确
+- [x] **4a-3** ~~`engine/block_manager.py`: hash/allocate 逻辑覆盖 draft 层~~ **确认不需要改**
+  - `BlockManager` 只发放/追踪 block id，不知道物理内容；target 和 draft 各自在同一个 block id 上维护自己的物理张量（`kv_cache` vs `draft_kv_cache`），无需 BlockManager 感知 draft 的存在
+  - preempt 时两者用同一批 block id，天然同生命周期失效
 
-- [ ] **4a-5** `spec_decode/proposer.py`: `propose()` 改为接收 target hidden states 直接作为参数
-  - 对齐 vLLM 接口：`propose(target_token_ids, target_positions, target_hidden_states, next_token_ids, ...)`
+- [x] **4a-4**（范围调整）`spec_decode/proposer.py`: 删除 dense `_kv` dict，改为 paged `draft_kv_cache`
+  - `_kv`（稠密 per-seq KV 张量）已删除，KV 进 `draft_kv_cache`（4a-2），按 `seq.block_table` 寻址
+  - `_draft_ctx_len`/`_aux`/`_draft0` 三个字典**保留**——`_draft_ctx_len` 是 KV 长度信息的替代（原来隐含在 `_kv` 张量长度里，paged 之后必须单独记录），`_aux`/`_draft0` 记录自链起点，三者都是**必要的调度状态**，不是待清理的暂存
+  - `extend()`/`drop()` 方法**保留**（原计划要求删除，见下方"为什么不删"说明）——重写为 batched varlen forward + paged cache 读写，语义不变
 
-- [ ] **4a-6** `model_runner.py`: 删除 `_pending_extend` 暂存机制
-  - 不再需要跨调用暂存 aux hidden
+- [x] **4a-6** `model_runner.py`: 删除 `_pending_extend` 跨轮暂存机制
+  - `extend()` 的调用时机从"下一轮 `run_spec` 开头消费 stash"改为"prefill 采样后 / verify rejection sampling 后立即执行"（`_extend_prefill_aux`/`_extend_verify_aux`）
+  - 因果顺序不变（extend 始终在为下一次 propose 准备状态），只是去掉了"暂存 → 下一轮取回"的中转
+  - 多 chunk prefill 不再手动拼接跨 chunk 的 tokens/positions/aux——每个 chunk 直接调一次 `extend()`，靠其内部 `assert start == _draft_ctx_len` 保证连续
 
-### 4c. Proposer 接口对齐
+**为什么不做 4a-5（`propose()` 直接接收 target hidden states）/ 不追求删除 `extend()`**：
 
-- [ ] **4c-1** `spec_decode/proposer.py`: `propose()` 签名对齐 vLLM
-  ```python
-  def propose(
-      self,
-      target_token_ids: torch.Tensor,
-      target_positions: torch.Tensor,
-      target_hidden_states: torch.Tensor,
-      next_token_ids: torch.Tensor,
-      ...
-  ) -> torch.Tensor:  # [batch_size, num_spec_tokens]
-  ```
+EAGLE3 的训练配对（`L_reg = SmoothL1(f_{i+1}, Draft(T_{2:i+1}, F_{1:i}))`）意味着 draft 预测 `t_{p+1}` 依赖 target 在 position p 的真实 hidden `f_p`，而 `f_p` 只产生于"验证 forward"，且验证发生在下一次 draft 自链**之前**的轮次——这是算法本身的因果链。vLLM 能一步做到 `propose(target_hidden_states=...)`，是因为统一调度把"补算已确认 token"和"验证本轮 draft"合并进了同一次 target forward，propose 直接吃这次 forward 产出的 hidden；nano-vllm 保留双路径调度（未做已废弃的 4b），没有这次"合并 forward"，所以 `extend`（消费上一轮验证 hidden，更新 committed 状态）与 `propose`（从 committed 状态自链）必须是两个独立步骤——这是 EAGLE3 算法在双路径调度下的**正确且自然**的实现形态，不是需要清理的技术债。4a-6 已经做了这个范围内唯一值得做的收敛（去掉跨轮暂存）。
 
-- [ ] **4c-2** `model_runner.py`: `run_spec` 内直接调 `propose(target_hidden_states=...)`
-  - 不再先 extend 再 propose
+### 4c. Proposer 接口对齐 —— **已废弃**
+
+**结论：不做。** 4c 的目标（`propose(target_hidden_states=...)` 一步完成、无独立 `extend`）等价于要求 nano-vllm 采用 vLLM 的统一调度（4b），而 4b 已经因为"保留双路径调度"的决策被废弃。强行只合并 `extend`+`propose` 而不做统一调度，会打破"propose 在 verify 之前、只能读上一轮 hidden"的因果链，是"为对齐而对齐"，不产生正确性或性能收益。理由详见上方 4a"为什么不做 4a-5"的说明。
+
+原计划内容（存档，不再执行）：
+- `propose()` 签名改为 `propose(target_token_ids, target_positions, target_hidden_states, next_token_ids, ...) -> torch.Tensor`
+- `run_spec` 内直接调 `propose(target_hidden_states=...)`，不再先 extend 再 propose
 
 ---
 
@@ -303,12 +305,13 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 阶段二 (正确性)
   │ 3-1, 3-2, 3-3（独立，可与阶段三并行准备）
   ▼
-阶段三 (对齐 vLLM 架构)
-  │ 主线：4a (draft paged attention) → 4c (propose 接口对齐)
-  │   ├─ 4a 完成后：删除 _pending_extend、extend()、drop()
-  │   └─ 4c 依赖 4a，完成后 propose 接口与 vLLM 一致
+阶段三 (对齐 vLLM 核心架构)
+  │ 4a (draft paged attention) —— ✅ 已完成并验证
+  │   ├─ draft KV 接入分页存储，与 target 共享 block id 空间
+  │   └─ 删除跨轮暂存 `_pending_extend`（extend 时机提前到数据产生的同一轮）
+  │ 4c (propose 接口对齐) —— ❌ 已废弃，见 4c 小节理由
   ▼
-  ✅ 架构与 vLLM 对齐（4a + 4c）
+  ✅ 4a 完成；extend()/propose() 两步分离是 EAGLE3 双路径调度下的正确形态，非待办
   │
 阶段四 (功能增强)
   │ 5-1, 5-2, 5-3, 5-4（独立）
