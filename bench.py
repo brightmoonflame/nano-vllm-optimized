@@ -28,8 +28,10 @@ def main():
     speculative_config = {"model": draft_path, "num_spec_tokens": 5} if draft_path else None
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
-    # temperature=0 (greedy): spec decode is greedy-only, so this ensures
-    # spec and non-spec produce identical output for correctness verification.
+    # temperature=0 (greedy): greedy spec decode is deterministic, so spec and
+    # non-spec produce identical output for correctness verification.
+    # (spec decode also supports temperature/top-k/top-p sampling; greedy is
+    # just the mode where output is bit-for-bit comparable.)
     sampling_params = [SamplingParams(temperature=0, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
 
     # --- Correctness check: spec vs non-spec output must match under greedy ---

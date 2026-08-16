@@ -126,7 +126,7 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 | propose 接口 | 接收 target_hidden_states 作为参数、一步完成 catch-up+自链 | `extend`（消费 verify hidden）+ `propose`（自链）两步分离 | 接口不对齐，但**4c 已废弃**，不再追求合并（见下方说明） |
 | aux hidden | 模型 forward 返回字段，同调用内传递 | 挂在模型上，需手动提取；`extend` 在产生的同一轮内立即消费（无暂存） | 流通方式不同，风险已消除 |
 | tree attention | 不支持 | 不支持 | 一致，不需要做 |
-| rejection sampling | `RejectionSampler(sampler, config, device)` | `RejectionSampler()` 无参数 | 接口差异 |
+| rejection sampling | `RejectionSampler(sampler, config, device)` | `RejectionSampler(sampler)`，注入引擎 Sampler（5-4 已做）；省略 config/device（张量自带 device，无 spec-config 可查） | 已收敛，仅剩参数精简（有意为之） |
 
 > **调度差异已主动保留**：nano-vllm 保留 `schedule()` / `schedule_chunked()` 两条路径的设计，
 > 不对齐 vLLM V1 的统一调度（见阶段三 4b 已删除）。混批中 prefill 行与 spec decode 行
