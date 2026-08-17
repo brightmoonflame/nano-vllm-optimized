@@ -6,7 +6,7 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache
-from nanovllm.layers.triton_attn import triton_flash_attn_varlen
+from nanovllm.layers.triton_attn import triton_flash_attn_varlen, triton_paged_attention
 
 
 @triton.jit
@@ -97,11 +97,16 @@ class Attention(nn.Module):
         else:    # decode
             if self.kv_quant:
                 # Dequantize INT8 cache to temporary BF16 tensor (caching allocator reuses memory).
+                # kv_quant stays on this flash_attn path until the fused INT8 kernel (stage 3).
                 k_bf16 = dequant_kvcache(k_cache, self.k_scale)
                 v_bf16 = dequant_kvcache(v_cache, self.v_scale)
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True, window_size=window_size)
+            elif self.use_triton_attn and self.sliding_window is None:
+                # Triton paged attention (stage 2): single query over paged KV cache, BF16.
+                o = triton_paged_attention(q, k_cache, v_cache,
+                                           context.block_tables, context.context_lens, self.scale)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,

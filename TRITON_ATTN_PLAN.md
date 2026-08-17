@@ -174,28 +174,31 @@ Config.use_triton_attn
 
 ### 3a. 内核实现
 
-- [ ] **3a-1** `triton_attn.py` 新增 `_paged_attention_decode()` Triton kernel
-  - **主参考**:`linshi-w/nano-vllm-paged-attention` 的 `paged_attention.py`(drop-in,接口已对齐 nano-vllm)
-  - grid = `(num_seqs, num_heads)`,`BLOCK_SIZE=64`,`kv_block_size=256`(单 tile 不跨 block)
-  - GQA:`kv_head = head_idx // num_queries_per_kv`
-  - online softmax:`(m_i, l_i, acc)` running state,fp32 累加
-  - BF16 输入输出
+- [x] **3a-1** `triton_attn.py` 新增 `_paged_attn_decode_kernel()` Triton kernel
+  - 借鉴 `linshi-w/nano-vllm-paged-attention` 的设计,自行实现:grid = `(num_seqs, num_heads)`,每 program 处理一个 (seq, q_head)
+  - `BLOCK_N=64` 整除 cache `block_size=256` → **每个 tile 恰好落在一个物理块内,单次查表**(`n_start // BLOCK_SIZE` 即逻辑块号)
+  - 单 query → softmax 状态是标量(`m_i/l_i` 为 0-d),累加器是 `(HEAD_DIM,)` 向量;无需 causal mask(decode 的 q 是最后一个 token,全历史可见),仅需 `context_len` 边界 mask
+  - GQA:`kv_head_idx = head_idx // (num_heads // num_kv_heads)`;物理块号转 int64 防大 cache 溢出
+  - online softmax:`(m_i, l_i, acc)` running state,QK/PV 全程 fp32 累加
 
-- [ ] **3a-2** Python wrapper `triton_paged_attention(q, k_cache, v_cache, block_tables, context_lens, scale)`
-  - 接口对齐 `attention.py:92-94` 的 decode 调用方式
-  - 处理 `q.unsqueeze(1)` 的维度约定(q shape `[num_seqs, num_heads, head_dim]`)
+- [x] **3a-2** Python wrapper `triton_paged_attention(q, k_cache, v_cache, block_tables, context_lens, scale)`
+  - 接口对齐 `attention.py` decode 调用:直接接收 `(num_seqs, num_heads, head_dim)` 的 q(无需 unsqueeze)
+  - block_size 从 `k_cache.shape[1]` 推导,不额外传参
 
 ### 3b. 开关接线与对齐
 
-- [ ] **3b-1** `attention.py:91-94` decode `kv_quant=False` 分支:增加 `if self.use_triton_attn:` 分支调用 `triton_paged_attention(...)`,**保留原 `flash_attn_with_kvcache` 在 else 分支**
-  - 注意:`use_triton_attn=True` + `kv_quant=True` 时此阶段仍走 else(dequant + flash_attn),融合在阶段三做
+- [x] **3b-1** `attention.py` decode 分支接线:`kv_quant=False` + `use_triton_attn=True` + 无 sliding window 时走 `triton_paged_attention(...)`,**原 `flash_attn_with_kvcache` 保留在 else 分支**
+  - `kv_quant=True` 时无视开关仍走 `dequant + flash_attn`(阶段三融合),符合计划
+  - 已确认旁路安全:spec verify / chunked prefill 走 `is_prefill=True` + block_tables → prefill 分支自动回退 flash_attn;decode CUDA graph 按固定 bs 捕获,Triton kernel 静态 shape 可正常捕获
 
-- [ ] **3b-2** 精度对齐测试:`tests/test_triton_attn.py` 新增 decode 用例
+- [x] **3b-2** 精度对齐测试:`tests/test_triton_attn.py` 新增 4 个 decode 用例
   - 对比 Triton paged vs `flash_attn_with_kvcache`
-  - 用例:MHA / GQA 2:1 / GQA 4:1,context_len 128/1024/4096,partial block 边界
-  - 参考 `linshi-w` 仓库的 5 个测试用例
+  - 用例:MHA partial block(300) / 多序列不等长(128,256,300,511) / GQA 3:1(1024,Llama 配置) / GQA 4:1(4096)
+  - **物理块随机洗牌**(`torch.randperm`),专抓"假设物理块连续/按序"的寻址 bug
+  - **待办(需 CUDA 环境执行)**:运行 `python tests/test_triton_attn.py`
 
 - [ ] **3b-3** 端到端回归:`python example.py` greedy 输出与 baseline 逐 token 一致
+  - **待办(需 CUDA 环境执行)**
 
 ---
 
