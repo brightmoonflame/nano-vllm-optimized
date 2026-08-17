@@ -36,6 +36,60 @@ import torch
 from nanovllm import LLM, SamplingParams
 
 
+# A short corpus of real English prose. Prompts are drawn from this text's
+# token encoding rather than uniform random tokens: random token prompts
+# carry no semantics, so the draft's accept rate swings wildly with the
+# prompt's incidental structure, making speedup unreproducible. Real prose
+# keeps accept rate — and therefore speedup — stable and meaningful.
+REAL_TEXT = (
+    "Machine learning is a branch of artificial intelligence that enables systems to learn from data "
+    "and improve their performance on a task without being explicitly programmed for every case. "
+    "A model is trained by adjusting its parameters so that its predictions match observed outcomes, "
+    "using an objective function that measures the difference between the two. "
+    "Deep learning builds on this idea by stacking many layers of simple computations, letting the "
+    "network discover hierarchical representations of its input. Convolutional networks excel at "
+    "image data, while recurrent and attention-based architectures dominate natural language. "
+    "The transformer, introduced in 2017, replaced recurrence with self-attention, allowing every "
+    "position in a sequence to attend to every other position in parallel. This made it practical to "
+    "train much larger models on much more data, and it became the foundation of modern language models. "
+    "A large language model is a transformer trained to predict the next token in a text sequence. "
+    "During training it reads enormous corpora of books, articles, code, and conversation, learning "
+    "patterns of grammar, reasoning, and world knowledge in the process. At inference time it generates "
+    "text one token at a time, each step conditioned on all the tokens produced so far. "
+    "The quality of generated text depends on the training data, the model size, and the decoding strategy. "
+    "Greedy decoding always picks the single most likely next token, which is deterministic but can "
+    "produce repetitive text. Sampling introduces randomness by drawing from the model's probability "
+    "distribution, and temperature controls how sharply that distribution is peaked. "
+    "Top-k and top-p filtering discard the long tail of unlikely tokens to keep output coherent. "
+    "Language models are used for translation, summarization, question answering, code completion, and "
+    "conversation. They also raise important questions about bias, factual accuracy, and responsible use, "
+    "because a model reflects patterns present in its training data rather than verified truth. "
+    "Careful evaluation and human oversight remain essential when these systems are deployed in practice. "
+    "Speculative decoding is a technique that accelerates generation by using a small draft model to "
+    "propose several candidate tokens at once, which a larger target model then verifies in a single "
+    "forward pass. When the draft guesses correctly, several tokens are accepted in one step instead of "
+    "one, reducing the number of sequential passes through the target model and thereby lowering latency. "
+    "The acceptance rate, meaning how many of the draft's proposals the target agrees with, is the key "
+    "factor determining how much speedup is achieved, and it depends strongly on how well the draft "
+    "matches the target's predictions on the input at hand."
+)
+
+
+def make_real_prompt(llm: LLM, length: int, offset_seed: int) -> list[int]:
+    """Return a `length`-token prompt drawn from REAL_TEXT.
+
+    Encodes the corpus once, starts at a seed-determined offset, and wraps
+    around (repeating the text) if `length` exceeds the remaining tokens.
+    """
+    rng = random.Random(offset_seed)
+    base = llm.tokenizer.encode(REAL_TEXT)
+    start = rng.randrange(len(base))
+    tokens = base[start:] + base[:start]
+    while len(tokens) < length:
+        tokens.extend(base)
+    return tokens[:length]
+
+
 def build_llm(target_model, draft_model, num_spec_tokens, gpu_memory_utilization):
     speculative_config = (
         {"model": draft_model, "num_spec_tokens": num_spec_tokens}
@@ -67,8 +121,8 @@ def run_offline(llm, num_seqs, max_input_len, max_output_len, temperature, seed)
     """
     rng = random.Random(seed)
     prompts = [
-        [rng.randrange(10000) for _ in range(rng.randint(100, max_input_len))]
-        for _ in range(num_seqs)
+        make_real_prompt(llm, rng.randint(100, max_input_len), seed + i)
+        for i in range(num_seqs)
     ]
     sampling_params = [
         SamplingParams(temperature=temperature, ignore_eos=True, max_tokens=max_output_len)
@@ -105,10 +159,10 @@ def run_offline(llm, num_seqs, max_input_len, max_output_len, temperature, seed)
 def check_correctness(target_model, draft_model, num_spec_tokens, max_input_len,
                       gpu_memory_utilization, seed):
     rng = random.Random(seed)
-    prompt = [rng.randrange(10000) for _ in range(rng.randint(100, max_input_len))]
     sp = SamplingParams(temperature=0, ignore_eos=True, max_tokens=32)
 
     llm = build_llm(target_model, None, num_spec_tokens, gpu_memory_utilization)
+    prompt = make_real_prompt(llm, rng.randint(100, max_input_len), seed)
     ref = llm.generate([prompt], [sp], use_tqdm=False)[0]["token_ids"]
     free_llm(llm)
 
