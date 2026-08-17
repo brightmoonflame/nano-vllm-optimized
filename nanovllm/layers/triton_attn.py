@@ -175,9 +175,13 @@ def _paged_attn_decode_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
     q = tl.load(q_ptr + seq_idx * stride_qn + head_idx * stride_qh + offs_d)
 
-    # Running online-softmax state: scalar max / sumexp + vector accumulator.
-    m_i = tl.full([], float("-inf"), dtype=tl.float32)
-    l_i = tl.full([], 0.0, dtype=tl.float32)
+    # Running online-softmax state. Kept as shape-(1,) tensors on purpose:
+    # 0-d (shape-[]) scalars mixed with 1-D/2-D operands in broadcasts are
+    # unreliable across Triton versions (produced all-NaN output here), while
+    # this (1,)-state layout is structurally identical to the verified
+    # prefill kernel's (BLOCK_M,)-state — same code path, just BLOCK_M == 1.
+    m_i = tl.full((1,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((1,), dtype=tl.float32)
     acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
 
     # The query is the last token, so every key position [0, context_len) is
@@ -197,19 +201,20 @@ def _paged_attn_decode_kernel(
         qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1) * scale
         qk = tl.where(mask_n, qk, float("-inf"))
 
-        m_new = tl.maximum(m_i, tl.max(qk, axis=0))
-        p = tl.exp(qk - m_new)
-        alpha = tl.exp(m_i - m_new)
+        m_ij = tl.max(qk[None, :], axis=1)          # (1,)
+        m_new = tl.maximum(m_i, m_ij)               # (1,)
+        p = tl.exp(qk - m_new)                      # (BLOCK_N,) - (1,) -> (BLOCK_N,)
+        alpha = tl.exp(m_i - m_new)                 # (1,)
 
         v_off = (physical_block.to(tl.int64) * stride_vb
                  + offs_n[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
         v = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
 
-        l_i = l_i * alpha + tl.sum(p, axis=0)
+        l_i = l_i * alpha + tl.sum(p[None, :], axis=1)          # (1,)
         acc = acc * alpha + tl.sum(p[:, None] * v.to(tl.float32), axis=0)
         m_i = m_new
 
-    acc = acc / l_i
+    acc = acc / l_i                                 # (HEAD_DIM,) / (1,) -> (HEAD_DIM,)
     tl.store(o_ptr + seq_idx * stride_on + head_idx * stride_oh + offs_d,
              acc.to(o_ptr.dtype.element_ty))
 
