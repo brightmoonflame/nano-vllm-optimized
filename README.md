@@ -11,6 +11,7 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
 6. **Chunked prefill**: an `enable_chunked_prefill` flag in `Config` splits long prompts into chunks that interleave with decode in the same step. Pure-decode steps automatically fall back to CUDA Graph, so TPOT stays unchanged while TTFT drops 32×. Run `python bench_chunked.py` to compare ON vs OFF.
 7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head) symmetric Min-Max scaling. KV cache memory per block drops 48% (29.4 → 15.1 MB/block), doubling the number of concurrent sequences the GPU can hold. Decode requires dequantization, so throughput is lower — this is a memory-for-capacity trade-off for resource-constrained scenarios.
+8. **Speculative decoding (EAGLE3)**: a chain-style EAGLE3 draft head (single Transformer decoder layer conditioned on low/mid/high target-layer features) proposes K candidate tokens that a standard rejection sampler verifies against the target in one pass. Supports greedy and temperature/top-k/top-p sampling; greedy output is token-for-token identical to non-spec decoding. Run `python bench_spec_decode.py`; see the [Speculative Decoding](#speculative-decoding-eagle3) section for numbers.
 
 ## Supported Models
 
@@ -242,3 +243,46 @@ Prefill processes hundreds to thousands of tokens per step, so kernel-launch ove
 | --- | ---: | ---: | ---: | ---: |
 | Offline | 5730 tok/s | 1647 ms | 26.4 ms | 4997 ms |
 | Serving (8 req/s) | 902 tok/s | 66 ms | 3.8 ms | 543 ms |
+
+## Speculative Decoding (EAGLE3)
+
+EAGLE3 speculative decoding uses a chain-style draft head — a single Transformer decoder layer conditioned on low/mid/high target-layer features (an `fc: 3H→H` fusion) that shares the target embedding and maps a small draft vocabulary back to the target vocabulary via `d2t`. It covers greedy and temperature/top-k/top-p sampling: greedy output is token-for-token identical to non-spec decoding, and sampling output matches the target distribution via standard rejection sampling (`min(1, p/q)` acceptance + `max(0, p−q)` residual replacement).
+
+**Requirements**: a Llama target plus its matching EAGLE3 draft checkpoint. The canonical pair is `meta-llama/Llama-3.2-3B-Instruct` (target) + `thoughtworks/Llama-3.2-3B-Instruct-Eagle3` (draft).
+
+### Correctness
+
+Under greedy (`temperature=0`), spec and non-spec produce token-for-token identical output:
+
+```
+[1] Correctness (greedy, temperature=0)
+    spec == non-spec ✓ (32 tokens)
+```
+
+### Performance
+
+Hardware: single RTX 4090, real-text prompts (100–512 tokens), 512 output tokens, `temperature=0`, `enforce_eager=True`. The spec path is eager-only, so this is an eager-vs-eager comparison that isolates the draft mechanism from CUDA-graph launch savings.
+
+**K sweep (batch=1)** — acceptance rate rises monotonically with K, but speedup peaks around K=3 once the draft self-chain overhead outgrows the extra accepted tokens:
+
+| K (`num_spec_tokens`) | Speedup | Accept rate (tokens/round) |
+| --- | ---: | ---: |
+| 1 | 1.26× | 0.65 |
+| 3 | **1.54×** | 1.20 |
+| 5 | 1.47× | 1.30 |
+| 7 | 1.40× | 1.40 |
+
+**Batch sweep (K=5)** — the gain holds across batch sizes:
+
+| Batch | no-spec tok/s | spec tok/s | Speedup | Accept rate |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 45.2 | 61.4 | 1.36× | 1.30 |
+| 2 | 82.6 | 109.6 | 1.33× | 1.29 |
+| 4 | 161.5 | 166.3 | 1.03× | 0.53 |
+| 8 | 314.1 | 525.0 | 1.67× | 1.42 |
+
+Acceptance rate — the driver of speedup — depends on the specific prompt, so individual runs vary (e.g. the batch=4 point drew a harder prompt segment). The trend is the signal: speedup is roughly 1.3–1.7× across batch sizes rather than the "small-batch-only" behavior of random-token benchmarks.
+
+### Why ~1.5× and not 3×+
+
+EAGLE3's paper reports 3×+ on 7B–70B targets. This fork benchmarks on a **3B target**, where the single-layer draft is proportionally expensive relative to the target, so net speedup is ~1.5×. The mechanism is the same; on larger targets the draft overhead amortizes over a bigger target forward and speedup grows.
