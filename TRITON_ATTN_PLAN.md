@@ -160,7 +160,11 @@ Config.use_triton_attn
 
 - [x] **2c-2** 端到端回归:`python example.py` 输出文本与 baseline 一致(greedy)
   - ✅ 已验证:Llama-3.2-3B 下 `use_triton_attn=True/False` 两次 greedy 输出逐字一致
-  - [ ] 性能对比:`python bench_triton_prefill.py`(纯算子级)记录 Triton vs flash_attn 的 prefill 延迟比值(预期 80~95%)
+  - ✅ 性能对比(`bench_triton_prefill.py`,RTX 4090,Llama-3.2-3B GQA 3:1):
+    - 定向调优 `BLOCK_M 64→128` + `num_warps 4→8` 后,长序列从 66% 提升到 80%+
+    - 最终:`512→94.3%` / `2048→110%` / `4096→83.5%` / `8192→80.6%`
+    - `1024→141.8%` 为 flash_attn 该 seqlen 档位自身偏慢(非 Triton 特别快),归因需注明
+  - **阶段一达标收尾**:短序列打平/反超,长序列落在 80~95% 预期区间
 
 ---
 
