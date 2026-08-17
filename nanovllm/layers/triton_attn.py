@@ -187,15 +187,19 @@ def _paged_attn_decode_kernel(
     # The query is the last token, so every key position [0, context_len) is
     # visible — no causal mask needed, only the context_len boundary.
     # BLOCK_N divides BLOCK_SIZE, so each tile lies inside exactly one cache
-    # block and a single block_table lookup per tile suffices.
+    # block and a single block_table lookup per tile suffices. NOTE: the mask
+    # uses GLOBAL logical positions, but addressing must use WITHIN-BLOCK
+    # offsets — conflating the two reads past the block boundary once a
+    # sequence spans its second block (offsets >= block_size).
     for n_start in range(0, context_len, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
+        offs_n = n_start + tl.arange(0, BLOCK_N)                       # global positions (mask)
         mask_n = offs_n < context_len
+        offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)   # within-block offsets (addressing)
 
         physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
 
         k_off = (physical_block.to(tl.int64) * stride_kb
-                 + offs_n[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
+                 + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
         k = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
 
         qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1) * scale
@@ -207,7 +211,7 @@ def _paged_attn_decode_kernel(
         alpha = tl.exp(m_i - m_new)                 # (1,)
 
         v_off = (physical_block.to(tl.int64) * stride_vb
-                 + offs_n[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
+                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
         v = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
 
         l_i = l_i * alpha + tl.sum(p[None, :], axis=1)          # (1,)
