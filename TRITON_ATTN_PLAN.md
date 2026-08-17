@@ -239,13 +239,15 @@ Config.use_triton_attn
   - 已添加 4 个用例(`tests/test_triton_attn.py`):跨块 partial(300) / 多序列(128,256,511) / GQA 3:1(2048) / GQA 4:1(4096),量化模拟 + 物理块洗牌
   - **待办(需 CUDA 环境执行)**:运行 `python -u tests/test_triton_attn.py`
 
-- [ ] **4c-2** 端到端精度:`python example.py` 用 `kv_quant=True` + `use_triton_attn=True` 跑
-  - 对比 `kv_quant=True` + `use_triton_attn=False`(dequant 路径)的生成结果 token 一致率
-  - **待办(需 CUDA 环境执行)**
+- [x] **4c-2** 端到端精度:`python example.py` 用 `kv_quant=True` + `use_triton_attn=True` 跑
+  - ✅ 已验证:INT8 融合路径 greedy 输出与 BF16 逐字一致
+  - ✅ **显存收益确凿**:同样 12.1GB 显存,INT8 装 803 blocks vs BF16 414 blocks(近 2 倍,即并发/上下文容量翻倍)
 
-- [ ] **4c-3** 性能对比:`bench_triton_decode.py` 新增 INT8 四路对比(`dequant+flash` 现状 / `flash BF16` 上限 / `triton BF16` / `triton INT8 融合`)
-  - 已实现,输出 `int8 vs dequant`(融合收益)和 `int8 vs flash_bf16`(是否反超)两个比值
-  - **待办(需 CUDA 环境执行)**
+- [x] **4c-3** 性能对比:`bench_triton_decode.py` 新增 INT8 四路对比(`dequant+flash` 现状 / `flash BF16` 上限 / `triton BF16` / `triton INT8 融合`)
+  - ✅ 已验证(RTX 4090,batch=32):
+    - `int8 vs dequant` = 2.96~3.74x(融合消除整 cache dequant 的两趟读写)
+    - `int8 vs flash_bf16` = **1.03~1.17x(反超 flash_attn,随 ctx 增大)**
+  - 结论:**INT8 融合 = 显存减半 + 反超 flash_attn,计划核心支点达成**
 
 ---
 
