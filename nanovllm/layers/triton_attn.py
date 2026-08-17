@@ -231,7 +231,7 @@ def triton_paged_attention(
     context_lens: torch.Tensor,  # (num_seqs,) int32, total tokens cached per seq
     scale: float,
 ) -> torch.Tensor:
-    """Single-query paged attention over the paged KV cache (decode path).
+    """Single-query paged attention over the paged BF16 KV cache (decode path).
 
     A drop-in alternative to `flash_attn_with_kvcache` for the BF16 decode
     case. Returns a tensor shaped like q.
@@ -254,6 +254,140 @@ def triton_paged_attention(
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        o.stride(0), o.stride(1),
+        block_tables.stride(0),
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=block_size,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+    return o
+
+
+@triton.jit
+def _paged_attn_decode_int8_kernel(
+    q_ptr, k_cache_ptr, v_cache_ptr, k_scale_ptr, v_scale_ptr, o_ptr,
+    block_tables_ptr, context_lens_ptr,
+    scale,
+    stride_qn, stride_qh,
+    stride_kb, stride_kt, stride_kh,
+    stride_vb, stride_vt, stride_vh,
+    stride_ksc_b, stride_ksc_t,
+    stride_vsc_b, stride_vsc_t,
+    stride_on, stride_oh,
+    stride_bt,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,   # tokens per cache block (kvcache_block_size)
+    BLOCK_N: tl.constexpr,      # kv tokens per iteration; must divide BLOCK_SIZE
+):
+    """Fused INT8 decode attention: reads the INT8 paged cache directly and
+    dequantizes in-register — no whole-cache dequant pass, no intermediate
+    BF16 buffer. Used when kv_quant=True and use_triton_attn=True.
+
+    Per-(token, head) symmetric quantization lets the scale float out of the
+    dot product (scale is constant along head_dim), so we compute in int8 and
+    post-multiply the scale once per token instead of rescaling every element:
+        qk[t]  = k_scale[t] * softmax_scale * Σ_d q[d]·k_int8[t,d]
+        acc[d] += (p[t]·v_scale[t]) * v_int8[t,d]
+    """
+    seq_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    context_len = tl.load(context_lens_ptr + seq_idx)
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(q_ptr + seq_idx * stride_qn + head_idx * stride_qh + offs_d).to(tl.float32)
+
+    # Running online-softmax state (shape (1,) — see BF16 kernel note).
+    m_i = tl.full((1,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((1,), dtype=tl.float32)
+    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+
+    for n_start in range(0, context_len, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)                       # global (mask)
+        mask_n = offs_n < context_len
+        offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)   # within-block (addressing)
+
+        physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
+
+        # --- K: int8 dot product in fp32, then per-(token, head) scale ---
+        k_off = (physical_block.to(tl.int64) * stride_kb
+                 + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
+        k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
+        qk = tl.sum(q[None, :] * k_i8.to(tl.float32), axis=1)
+
+        k_sc = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
+                       + offs_in_block * stride_ksc_t + kv_head_idx,
+                       mask=mask_n, other=0.0)   # 0.0: unmasked garbage may be NaN → 0*x stays safe
+        qk = qk * k_sc * scale
+        qk = tl.where(mask_n, qk, float("-inf"))
+
+        # --- online softmax ---
+        m_ij = tl.max(qk[None, :], axis=1)          # (1,)
+        m_new = tl.maximum(m_i, m_ij)               # (1,)
+        p = tl.exp(qk - m_new)                      # (BLOCK_N,)
+        alpha = tl.exp(m_i - m_new)                 # (1,)
+
+        # --- V: merge p with v_scale into one per-token weight, then int8 FMA ---
+        v_off = (physical_block.to(tl.int64) * stride_vb
+                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
+        v_i8 = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
+        v_sc = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
+                       + offs_in_block * stride_vsc_t + kv_head_idx,
+                       mask=mask_n, other=0.0)
+        w = p * v_sc                                # both are 0 on padding → no NaN leak
+
+        l_i = l_i * alpha + tl.sum(p[None, :], axis=1)
+        acc = acc * alpha + tl.sum(w[:, None] * v_i8.to(tl.float32), axis=0)
+        m_i = m_new
+
+    acc = acc / l_i
+    tl.store(o_ptr + seq_idx * stride_on + head_idx * stride_oh + offs_d,
+             acc.to(o_ptr.dtype.element_ty))
+
+
+def triton_paged_attention_int8(
+    q: torch.Tensor,             # (num_seqs, num_heads, head_dim) BF16
+    k_cache: torch.Tensor,       # (num_blocks, block_size, num_kv_heads, head_dim) INT8
+    v_cache: torch.Tensor,       # same layout as k_cache, INT8
+    k_scale: torch.Tensor,       # (num_blocks, block_size, num_kv_heads) FP32
+    v_scale: torch.Tensor,       # same layout as k_scale
+    block_tables: torch.Tensor,  # (num_seqs, max_num_blocks) int32
+    context_lens: torch.Tensor,  # (num_seqs,) int32
+    scale: float,
+) -> torch.Tensor:
+    """Single-query paged attention over the paged INT8 KV cache (decode path).
+
+    A fused alternative to `dequant_kvcache + flash_attn_with_kvcache`:
+    reads INT8 once and dequantizes in-register instead of materializing a
+    whole-cache BF16 buffer every decode step. Returns a tensor shaped like q.
+    """
+    num_seqs, num_heads, head_dim = q.shape
+    num_blocks, block_size, num_kv_heads, _ = k_cache.shape
+    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+    assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
+    assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1
+    assert k_scale.stride(-1) == 1 and v_scale.stride(-1) == 1
+
+    BLOCK_N = 64    # divides block_size (256), so one tile never spans two cache blocks
+    assert block_size % BLOCK_N == 0
+
+    o = torch.empty_like(q)
+    grid = (num_seqs, num_heads)
+    _paged_attn_decode_int8_kernel[grid](
+        q, k_cache, v_cache, k_scale, v_scale, o,
+        block_tables, context_lens,
+        scale,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        k_scale.stride(0), k_scale.stride(1),
+        v_scale.stride(0), v_scale.stride(1),
         o.stride(0), o.stride(1),
         block_tables.stride(0),
         num_heads=num_heads,

@@ -18,7 +18,12 @@ _log("importing flash_attn ...")
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 _log("importing triton kernel ...")
-from nanovllm.layers.triton_attn import triton_flash_attn_varlen, triton_paged_attention
+from nanovllm.layers.triton_attn import (
+    triton_flash_attn_varlen,
+    triton_paged_attention,
+    triton_paged_attention_int8,
+)
+from nanovllm.layers.kv_quant import dequant_kvcache
 
 _log(f"cuda available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -132,6 +137,75 @@ def test_decode_gqa_4to1_long():
     _run_decode_case("decode_gqa_4to1(4096)", num_heads=16, num_kv_heads=4, head_dim=128, ctx_lens=[4096])
 
 
+def _quantize_cache(bf16_cache: torch.Tensor):
+    """Per-(token, head) symmetric min-max quantization, mirroring
+    store_kvcache_int8_kernel: scale = max|.|/127, int8 = round(x/scale)."""
+    sc = bf16_cache.float().abs().amax(dim=-1) / 127.0
+    sc = sc.clamp(min=1e-6)
+    i8 = torch.round(bf16_cache.float() / sc[..., None]).clamp(-127, 127).to(torch.int8)
+    return i8, sc
+
+
+def _run_decode_int8_case(name, num_heads, num_kv_heads, head_dim, ctx_lens,
+                          block_size=256, dtype=torch.bfloat16):
+    torch.manual_seed(0)
+    device = "cuda"
+    num_seqs = len(ctx_lens)
+    scale = head_dim ** -0.5
+
+    # Shuffled physical blocks + quantized cache (same recipe as BF16 decode cases).
+    blocks_per_seq = [(l + block_size - 1) // block_size for l in ctx_lens]
+    total_logical = sum(blocks_per_seq)
+    pool = torch.randperm(total_logical).tolist()
+    max_blocks = max(blocks_per_seq)
+    rows, ptr = [], 0
+    for nb in blocks_per_seq:
+        rows.append(pool[ptr:ptr + nb] + [0] * (max_blocks - nb))
+        ptr += nb
+    block_tables = torch.tensor(rows, dtype=torch.int32, device=device)
+
+    k_i8, k_sc = _quantize_cache(torch.randn(total_logical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
+    v_i8, v_sc = _quantize_cache(torch.randn(total_logical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
+    q = torch.randn(num_seqs, num_heads, head_dim, dtype=dtype, device=device)
+    context_lens = torch.tensor(ctx_lens, dtype=torch.int32, device=device)
+
+    # Reference: the exact default kv_quant=True path in attention.py —
+    # whole-cache dequant to BF16, then flash_attn. The fused kernel shares
+    # this numeric path (int8 × scale), so outputs should match closely.
+    _log(f"[{name}] running dequant + flash_attn_with_kvcache (reference) ...")
+    k_bf16 = dequant_kvcache(k_i8, k_sc)
+    v_bf16 = dequant_kvcache(v_i8, v_sc)
+    ref = flash_attn_with_kvcache(
+        q.unsqueeze(1), k_bf16, v_bf16,
+        cache_seqlens=context_lens, block_table=block_tables,
+        softmax_scale=scale, causal=True,
+    ).squeeze(1)
+
+    _log(f"[{name}] running triton_paged_attention_int8 (first call triggers JIT compile) ...")
+    out = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale)
+
+    max_abs_err = (out - ref).abs().max().item()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+    _log(f"[{name}] PASSED  max_abs_err={max_abs_err:.4e}")
+
+
+def test_decode_int8_partial_blocks():
+    _run_decode_int8_case("decode_int8_mha(300)", num_heads=8, num_kv_heads=8, head_dim=128, ctx_lens=[300])
+
+
+def test_decode_int8_multi_seq_uneven():
+    _run_decode_int8_case("decode_int8_multi(128,256,511)", num_heads=8, num_kv_heads=8, head_dim=128,
+                          ctx_lens=[128, 256, 511])
+
+
+def test_decode_int8_gqa_3to1():
+    _run_decode_int8_case("decode_int8_gqa_3to1(2048)", num_heads=24, num_kv_heads=8, head_dim=128, ctx_lens=[2048])
+
+
+def test_decode_int8_gqa_4to1_long():
+    _run_decode_int8_case("decode_int8_gqa_4to1(4096)", num_heads=16, num_kv_heads=4, head_dim=128, ctx_lens=[4096])
+
+
 if __name__ == "__main__":
     test_mha_short()
     test_mha_multi_seq_uneven()
@@ -141,4 +215,8 @@ if __name__ == "__main__":
     test_decode_multi_seq_uneven()
     test_decode_gqa_3to1()
     test_decode_gqa_4to1_long()
-    print("All precision tests passed (prefill FA2 + decode paged attention).", flush=True)
+    test_decode_int8_partial_blocks()
+    test_decode_int8_multi_seq_uneven()
+    test_decode_int8_gqa_3to1()
+    test_decode_int8_gqa_4to1_long()
+    print("All precision tests passed (prefill FA2 + decode paged + decode INT8 fused).", flush=True)

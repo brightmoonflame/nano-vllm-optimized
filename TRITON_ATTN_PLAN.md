@@ -209,18 +209,17 @@ Config.use_triton_attn
 
 ### 4a. 内核改造:decode 路径(优先,收益最大)
 
-- [ ] **4a-1** `triton_attn.py` 新增 `_paged_attention_decode_int8()` kernel
-  - 基于 3a-1 的 BF16 版本改造
-  - KV cache 读取改为:`tl.load` INT8 → 乘 `scale` → 转 BF16 → 直接进 QK 计算
-  - scale 读取:per-(token, head) FP32,从 `k_scale/v_scale` 张量按 block_table 寻址
+- [x] **4a-1** `triton_attn.py` 新增 `_paged_attn_decode_int8_kernel()` kernel
+  - 基于 3a-1 的 BF16 版本改造,KV cache 读取:`tl.load` INT8 → fp32 点积 → 乘 scale
+  - **scale 后置**(per-token 对称量化,scale 与 head_dim 无关,可从点积提出):`qk[t] = k_scale[t]·softmax_scale·Σ q·k_int8`,每 token 只乘 1 次而非每元素
+  - V 侧合并标量:`acc[d] += (p[t]·v_scale[t])·v_int8[t,d]`
+  - scale 寻址:`(blocks, block_size, kv_heads)` 布局,block_table + 块内偏移,mask 加载防未初始化 NaN(`0.0` other + `p=0` 双保险)
   - **不再调用 `dequant_kvcache`**,无中间 BF16 buffer
 
-- [ ] **4a-2** Python wrapper `triton_paged_attention_int8(q, k_cache_int8, v_cache_int8, k_scale, v_scale, block_tables, context_lens, scale)`
-  - 接口对齐 `attention.py:84-90` 的 INT8 decode 调用方式
+- [x] **4a-2** Python wrapper `triton_paged_attention_int8(q, k_cache_int8, v_cache_int8, k_scale, v_scale, block_tables, context_lens, scale)`
 
-- [ ] **4a-3** `attention.py:84-90` decode `kv_quant=True` 分支:增加 `if self.use_triton_attn:` 分支调用 `triton_paged_attention_int8(...)`,**保留原 `dequant_kvcache + flash_attn_with_kvcache` 在 else 分支**
-  - Triton 分支:不调用 `dequant_kvcache`,直接传 INT8 cache + scale 给融合内核
-  - else 分支(默认行为)不变,出问题可立即回退
+- [x] **4a-3** `attention.py` decode `kv_quant=True` 分支:嵌套 `use_triton_attn` 开关走融合内核,**原 `dequant_kvcache + flash_attn_with_kvcache` 保留在 else 分支**
+  - 四象限:`kv_quant × use_triton_attn` 独立组合,默认行为不变,出问题立即回退
 
 ### 4b. 内核改造:prefill 路径(次要,依赖阶段五)
 
@@ -236,18 +235,17 @@ Config.use_triton_attn
 ### 4c. 精度与性能验证
 
 - [ ] **4c-1** 精度对齐:INT8 融合内核 vs 当前 `dequant_kvcache + flash_attn_with_kvcache`
-  - 阈值:`atol=1e-1, rtol=1e-1`(INT8 量化本身有精度损失,阈值放宽)
-  - 关键:验证融合前后**输出一致**(因为只是把反量化从外部移到内部,数值路径相同)
+  - 阈值:`atol=1e-2, rtol=1e-2`(两者数值路径相同:都是 int8 × scale,仅 dequant 路径多一次中间 BF16 round,融合路径理论上更精确)
+  - 已添加 4 个用例(`tests/test_triton_attn.py`):跨块 partial(300) / 多序列(128,256,511) / GQA 3:1(2048) / GQA 4:1(4096),量化模拟 + 物理块洗牌
+  - **待办(需 CUDA 环境执行)**:运行 `python -u tests/test_triton_attn.py`
 
-- [ ] **4c-2** 端到端精度:`python example.py` 用 `kv_quant=True` 跑 Qwen3-0.6B
-  - 对比 `kv_quant=True` vs `kv_quant=False` 的生成结果 token 一致率
-  - 记录 perplexity 差异(若有评测脚本)
+- [ ] **4c-2** 端到端精度:`python example.py` 用 `kv_quant=True` + `use_triton_attn=True` 跑
+  - 对比 `kv_quant=True` + `use_triton_attn=False`(dequant 路径)的生成结果 token 一致率
+  - **待办(需 CUDA 环境执行)**
 
-- [ ] **4c-3** 性能对比:`bench.py` / `serving_bench.py` 四维指标
-  - decode TPOT:融合后 vs 融合前(当前 INT8 路径),期望提速
-  - 显存:INT8 vs BF16 KV,期望约省一半
-  - prefill 吞吐:Triton vs flash_attn,期望 80~95%
-  - 输出质量:INT8 vs BF16 token 一致率
+- [ ] **4c-3** 性能对比:`bench_triton_decode.py` 新增 INT8 四路对比(`dequant+flash` 现状 / `flash BF16` 上限 / `triton BF16` / `triton INT8 融合`)
+  - 已实现,输出 `int8 vs dequant`(融合收益)和 `int8 vs flash_bf16`(是否反超)两个比值
+  - **待办(需 CUDA 环境执行)**
 
 ---
 
