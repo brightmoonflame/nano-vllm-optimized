@@ -115,9 +115,10 @@ def run_offline(llm, num_seqs, max_input_len, max_output_len, temperature, seed)
     """Queue `num_seqs` requests and drive step() to completion.
 
     Returns dict with decode-phase wall time, tokens, step count, throughput
-    (tok/s) and mean accepted drafts per round (tokens/round - 1). Driving
-    step() directly (rather than generate()) lets us count decode rounds,
-    which is how acceptance rate is derived without touching engine internals.
+    (tok/s) and mean accepted drafts per sequence per round
+    (tokens/round/batch - 1). Driving step() directly (rather than
+    generate()) lets us count decode rounds, which is how acceptance rate is
+    derived without touching engine internals.
     """
     rng = random.Random(seed)
     prompts = [
@@ -146,7 +147,9 @@ def run_offline(llm, num_seqs, max_input_len, max_output_len, temperature, seed)
     elapsed = time.perf_counter() - t0
 
     throughput = total_decode_tokens / elapsed if elapsed > 0 else 0.0
-    accept = (total_decode_tokens / num_decode_steps - 1.0) if num_decode_steps else 0.0
+    # Each decode round emits (accepted drafts + 1) tokens per seq, so the
+    # per-seq mean accepted count is tokens/round/batch - 1.
+    accept = (total_decode_tokens / num_decode_steps / num_seqs - 1.0) if num_decode_steps else 0.0
     return {
         "elapsed": elapsed,
         "tokens": total_decode_tokens,
