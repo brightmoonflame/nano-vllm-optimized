@@ -156,11 +156,11 @@ Config.use_triton_attn
 - [x] **2c-1** 编写 `tests/test_triton_attn.py`:对比 Triton FA2 vs `flash_attn_varlen_func`
   - 用例:MHA / GQA 2:1 / GQA 4:1,seq_len 128/1024/4096(多序列不等长 varlen),causal=True
   - 精度阈值:`atol=1e-2, rtol=1e-2`(BF16 量级)
-  - **待办(需 CUDA 环境执行)**:本地开发机无 GPU,尚未实际跑过;需在有 CUDA 的机器上运行 `python tests/test_triton_attn.py` 验证通过
+  - ✅ **已验证通过**(RTX 4090):4 个用例全部 PASSED,`max_abs_err=3.9e-3`,远小于阈值
 
-- [ ] **2c-2** 端到端回归:`python example.py` 跑 Qwen3-0.6B,输出文本与 baseline 一致(greedy)
-  - 用 `bench.py` 对比 prefill 吞吐,记录 Triton vs flash_attn 的比值
-  - **待办(需 CUDA 环境执行)**
+- [x] **2c-2** 端到端回归:`python example.py` 输出文本与 baseline 一致(greedy)
+  - ✅ 已验证:Llama-3.2-3B 下 `use_triton_attn=True/False` 两次 greedy 输出逐字一致
+  - [ ] 性能对比:`python bench_triton_prefill.py`(纯算子级)记录 Triton vs flash_attn 的 prefill 延迟比值(预期 80~95%)
 
 ---
 
