@@ -195,10 +195,11 @@ Config.use_triton_attn
   - 对比 Triton paged vs `flash_attn_with_kvcache`
   - 用例:MHA partial block(300) / 多序列不等长(128,256,300,511) / GQA 3:1(1024,Llama 配置) / GQA 4:1(4096)
   - **物理块随机洗牌**(`torch.randperm`),专抓"假设物理块连续/按序"的寻址 bug
-  - **待办(需 CUDA 环境执行)**:运行 `python tests/test_triton_attn.py`
+  - ✅ **已验证通过**(RTX 4090):4 个 decode 用例全 PASSED,`max_abs_err=4.9e-4~2.0e-3`(单 query 累加更浅,比 prefill 还低)
+  - 调试记录:曾踩"块内偏移 vs 全局位置"混淆的越界 bug(首块碰巧正确、跨块读越界 → 100% NaN),已修复并回归通过
 
 - [ ] **3b-3** 端到端回归:`python example.py` greedy 输出与 baseline 逐 token 一致
-  - **待办(需 CUDA 环境执行)**
+  - **待办(需 CUDA 环境执行)**:`use_triton_attn=True` 跑一次对比 `False` 的 baseline
 
 ---
 
