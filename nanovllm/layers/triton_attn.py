@@ -120,7 +120,8 @@ def triton_flash_attn_varlen(
 
     o = torch.empty_like(q)
     num_seqs = cu_seqlens.numel() - 1
-    BLOCK_M = BLOCK_N = 64
+    BLOCK_M = 128
+    BLOCK_N = 64
     grid = (triton.cdiv(max_seqlen, BLOCK_M), num_heads, num_seqs)
 
     _fwd_kernel[grid](
@@ -136,5 +137,6 @@ def triton_flash_attn_varlen(
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        num_warps=8,
     )
     return o
