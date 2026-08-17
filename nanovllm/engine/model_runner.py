@@ -51,6 +51,11 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = model_dict[hf_config.model_type](hf_config)
         load_model(self.model, config.model)
+        # Must happen before warmup_model(): warmup runs a real prefill forward,
+        # so the switch needs to be in place for it to exercise the Triton path.
+        for module in self.model.modules():
+            if hasattr(module, "k_cache"):
+                module.use_triton_attn = config.use_triton_attn
         self.sampler = Sampler()
         # Draft model is a standalone HF model (not TP-sharded), so only rank 0
         # proposes + rejection-samples; other ranks only run the target forward.

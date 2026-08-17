@@ -6,6 +6,7 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache
+from nanovllm.layers.triton_attn import triton_flash_attn_varlen
 
 
 @triton.jit
@@ -51,6 +52,7 @@ class Attention(nn.Module):
         num_kv_heads,
         sliding_window=None,
         kv_quant=False,
+        use_triton_attn=False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -59,6 +61,7 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.kv_quant = kv_quant
+        self.use_triton_attn = use_triton_attn
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
 
@@ -75,11 +78,22 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables,
-                                       window_size=window_size)
+            # Triton FA2 (stage 1) only covers the dense, no-prefix-cache, global-attention
+            # case; prefix cache (paged k/v) and sliding window still fall back to flash_attn.
+            use_triton = (
+                self.use_triton_attn
+                and context.block_tables is None
+                and self.sliding_window is None
+            )
+            if use_triton:
+                o = triton_flash_attn_varlen(q, k, v, context.cu_seqlens_q,
+                                             max_seqlen=context.max_seqlen_q, scale=self.scale)
+            else:
+                o = flash_attn_varlen_func(q, k, v,
+                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                           softmax_scale=self.scale, causal=True, block_table=context.block_tables,
+                                           window_size=window_size)
         else:    # decode
             if self.kv_quant:
                 # Dequantize INT8 cache to temporary BF16 tensor (caching allocator reuses memory).
