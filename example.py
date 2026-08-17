@@ -30,13 +30,14 @@ def main():
     draft_path = os.path.expanduser("/root/model/Llama-3.2-3B-Instruct-Eagle3/")
     tokenizer = AutoTokenizer.from_pretrained(target_path)
 
-    # Disable speculative decoding so the prefill A/B below is a clean
+    # Disable speculative decoding so the prefill/decode A/B below is a clean
     # Triton-vs-flash_attn comparison (spec decode adds a separate HF draft
     # model + rejection sampling). Delete this line to re-enable it.
     draft_path = None
     speculative_config = {"model": draft_path, "num_spec_tokens": 5} if draft_path else None
     llm = LLM(target_path, enforce_eager=True, tensor_parallel_size=1,
               speculative_config=speculative_config,
+              kv_quant=True,          # INT8 KV cache (fused Triton dequant on decode)
               use_triton_attn=True)   # False = fall back to flash_attn (baseline)
 
     # temperature=0 (greedy) so spec output is identical to non-spec output.
