@@ -166,8 +166,8 @@ def calibrate_k_scales(
             layer_idx += 1
     assert layer_idx == num_layers, f"expected {num_layers} attention layers, found {layer_idx}"
 
-    input_ids = torch.randint(0, vocab_size, (1, seq_len), device=device)
-    positions = torch.arange(seq_len, device=device).unsqueeze(0)
+    input_ids = torch.randint(0, vocab_size, (seq_len,), device=device)   # varlen 1-D, no batch dim
+    positions = torch.arange(seq_len, device=device)
     cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
     # Prefill context so attention uses freshly-computed K/V (no KV-cache read).
     set_context(True, cu_seqlens, cu_seqlens, seq_len, seq_len, None, None, None)
