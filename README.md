@@ -10,8 +10,9 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
 5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
 6. **Chunked prefill**: an `enable_chunked_prefill` flag in `Config` splits long prompts into chunks that interleave with decode in the same step. Pure-decode steps automatically fall back to CUDA Graph, so TPOT stays unchanged while TTFT drops 32×. Run `python bench_chunked.py` to compare ON vs OFF.
-7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head) symmetric Min-Max scaling. KV cache memory per block drops 48% (29.4 → 15.1 MB/block), doubling the number of concurrent sequences the GPU can hold. Decode requires dequantization, so throughput is lower — this is a memory-for-capacity trade-off for resource-constrained scenarios.
+7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head) symmetric Min-Max scaling, halving per-block memory. Combined with the self-researched Triton fused-dequant kernel (item 9), decode reads the INT8 cache directly (no whole-cache dequant pass), so memory *and* throughput both improve — see the Triton Attention Kernels section.
 8. **Speculative decoding (EAGLE3)**: a chain-style EAGLE3 draft head (single Transformer decoder layer conditioned on low/mid/high target-layer features) proposes K candidate tokens that a standard rejection sampler verifies against the target in one pass. Supports greedy and temperature/top-k/top-p sampling; greedy output is token-for-token identical to non-spec decoding. Run `python bench_spec_decode.py`; see the [Speculative Decoding](#speculative-decoding-eagle3) section for numbers.
+9. **Self-researched Triton attention kernels**: FlashAttention-2 prefill (causal + GQA + varlen), paged-attention decode, a fused INT8 dequant decode kernel, and Flash-Decoding (split-K). Gated behind a `use_triton_attn` flag (default off, `flash_attn` package untouched). See the [Triton Attention Kernels](#triton-attention-kernels) section for benchmarks.
 
 ## Supported Models
 
@@ -204,16 +205,16 @@ Hardware: Qwen3-0.6B on a single RTX 4090. All features enabled, chunked prefill
 
 The 32× TTFT reduction comes from interleaving: the first request only needs to prefill one 512-token chunk before producing output, instead of waiting for all 8 requests to finish prefill. TPOT stays flat because pure-decode steps automatically fall back to CUDA Graph.
 
-#### INT8 KV cache quantization (`bench.py`)
+#### INT8 KV cache quantization (`bench.py` + `bench_memory.py`)
 
-256 requests, input 100–1024 tokens (uniform), `temperature=0.6`, `ignore_eos=True`. KV cache fills 90% of GPU memory in both cases.
+`bench_memory.py` measures KV-cache capacity under the same GPU memory budget (see Triton Attention Kernels below for throughput, which now *improves* with the fused INT8 kernel).
 
-| KV cache | Per-block memory | Blocks | Concurrent capacity | Throughput |
-| --- | ---: | ---: | ---: | ---: |
-| BF16 (default) | 29.4 MB | 677 | 1× | ~5470 tok/s |
-| INT8 (`kv_quant=True`) | **15.1 MB (-48%)** | **1314 (+94%)** | **~2×** | ~1165 tok/s |
+| KV cache | Per-block memory | Blocks | Concurrent capacity |
+| --- | ---: | ---: | ---: |
+| BF16 (default) | 29.4 MB | 414 | 1× |
+| INT8 (`kv_quant=True`) | **15.1 MB (-48%)** | **803 (+94%)** | **~2×** |
 
-INT8 quantization halves per-block memory, doubling the number of sequences the GPU can hold. Throughput drops because decode requires dequantization — this is a memory-for-capacity trade-off for resource-constrained scenarios where BF16 would OOM.
+INT8 quantization halves per-block memory, doubling the number of sequences (or max context length) the GPU can hold. With the fused Triton dequant kernel, this no longer costs throughput — see below.
 
 #### CUDA Graph (`serving_bench.py` + `bench_prefill_graph.py`)
 
@@ -243,6 +244,42 @@ Prefill processes hundreds to thousands of tokens per step, so kernel-launch ove
 | --- | ---: | ---: | ---: | ---: |
 | Offline | 5730 tok/s | 1647 ms | 26.4 ms | 4997 ms |
 | Serving (8 req/s) | 902 tok/s | 66 ms | 3.8 ms | 543 ms |
+
+## Triton Attention Kernels
+
+Self-researched Triton kernels replace the `flash_attn` package on the prefill and decode paths, gated behind `use_triton_attn` (default off). Four pieces: FlashAttention-2 prefill, paged-attention decode, fused INT8 dequant decode, and Flash-Decoding (split-K).
+
+Hardware: Llama-3.2-3B-Instruct (24 Q / 8 KV heads, GQA 3:1), single RTX 4090.
+
+### Kernel-level latency
+
+`bench_triton_prefill.py` / `bench_triton_decode.py` compare the raw kernels against `flash_attn` (ratio = triton / flash_attn, <1 means Triton is faster):
+
+- **Prefill FA2**: ~94–110% of `flash_attn_varlen_func` (long sequences 80%+ after `BLOCK_M=128` tuning).
+- **Decode paged (BF16)**: ~92–98% of `flash_attn_with_kvcache` at batch ≥32; small batch ~1.85× slower (Flash-Decoding improves this from ~2.4× but does not yet close the gap — a known limitation).
+- **Decode fused INT8**: **~1.03–1.17× faster than `flash_attn` BF16** (reads half the bytes), and **~3–3.7× faster than the default `dequant + flash_attn` INT8 path** (eliminates the whole-cache dequant pass).
+
+### Memory
+
+`bench_memory.py`: INT8 KV cache holds **~2× the blocks/tokens** of BF16 under the same GPU budget (803 vs 414 blocks on Llama-3.2-3B).
+
+### Accuracy
+
+`bench_accuracy.py`: greedy output of `kv_quant=True` vs `kv_quant=False` (both on Triton kernels) — reports exact-match rate and token-match rate.
+
+### CUDA Graph
+
+With the fused INT8 kernel there is no dynamic dequant, so `kv_quant=True` no longer disables CUDA Graph — INT8 + Triton + CUDA Graph can be enabled together (run `example.py` with `enforce_eager=False`).
+
+### Commands
+
+```bash
+python bench_triton_prefill.py
+python bench_triton_decode.py
+python bench_memory.py --model /root/model/Llama-3.2-3B-Instruct
+python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct
+python serving_bench.py --model /root/model/Llama-3.2-3B-Instruct --mode offline --use-triton-attn --kv-quant
+```
 
 ## Speculative Decoding (EAGLE3)
 
