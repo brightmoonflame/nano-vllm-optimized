@@ -125,7 +125,11 @@ def teacher_forced_eval(model: str, kv_quant: bool, prompts: list[str], continua
         sched.running.remove(seq)
 
     llm.exit()
-    del llm
+    # `engine`/`runner`/`sched` hold references to the ModelRunner (and its
+    # multi-GB KV cache). They must be released BEFORE gc.collect()/empty_cache,
+    # or the KV cache stays allocated and the NEXT LLM instance's
+    # allocate_kv_cache() sees no free VRAM (num_kvcache_blocks <= 0).
+    del llm, engine, runner, sched
     gc.collect()
     torch.cuda.empty_cache()
     return all_preds, total_lp, total_n
