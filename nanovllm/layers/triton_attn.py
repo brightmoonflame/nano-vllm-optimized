@@ -34,6 +34,10 @@ import triton
 import triton.language as tl
 
 
+_NUM_SMS = None   # cached lazily: torch.cuda.get_device_properties is too
+                  # expensive to call on every decode launch (10-30% overhead).
+
+
 def _num_splits_for(num_seqs: int, num_heads: int) -> int:
     """Pick the KV split count (flash-decoding) for a decode batch.
 
@@ -43,8 +47,10 @@ def _num_splits_for(num_seqs: int, num_heads: int) -> int:
     of two for the reduce kernel's `tl.arange`. Static inputs only — no
     GPU→CPU sync, so this stays CUDA-graph friendly.
     """
-    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-    want = max(1, -(-(num_sms * 4) // (num_seqs * num_heads)))
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    want = max(1, -(-(_NUM_SMS * 4) // (num_seqs * num_heads)))
     return 1 << (want - 1).bit_length()
 
 
@@ -257,9 +263,15 @@ def _paged_attn_decode_kernel(
     # BLOCK_N so a tile never spans two segments. Empty segments (n_lo past
     # the end) keep the initial (-inf, 0, 0) state — a zero contribution in
     # the reduce kernel, so no special-casing is needed.
-    seg_len = tl.cdiv(tl.cdiv(context_len, BLOCK_N), NUM_SPLITS) * BLOCK_N
-    n_lo = split_idx * seg_len
-    n_hi = tl.minimum(n_lo + seg_len, context_len)
+    # NUM_SPLITS == 1 keeps the original constant lower bound: a runtime
+    # n_lo (even though always 0) measurably blocks loop optimizations.
+    if NUM_SPLITS == 1:
+        n_lo = 0
+        n_hi = context_len
+    else:
+        seg_len = tl.cdiv(tl.cdiv(context_len, BLOCK_N), NUM_SPLITS) * BLOCK_N
+        n_lo = split_idx * seg_len
+        n_hi = tl.minimum(n_lo + seg_len, context_len)
 
     # The query is the last token, so every key position [0, context_len) is
     # visible — no causal mask needed, only the context_len boundary.
@@ -358,15 +370,11 @@ def triton_paged_attention(
         )
         return o
 
-    # Small batches: partition KV across splits, then reduce. The mid buffer
-    # is pre-poisoned to a mathematically-empty split state (m=-inf, l=0,
-    # acc=0): any slot a kernel instance fails to write (observed on one
-    # INT8 compiler specialization with many empty splits) then contributes
-    # exp(-inf - m_g) = 0 to the reduce instead of leaking uninitialized
-    # NaN bits through max()/exp().
-    mid = torch.zeros(num_seqs * num_heads, num_splits, head_dim + 2,
+    # Small batches: partition KV across splits, then reduce. Every program
+    # writes its split slot unconditionally (no early return in the kernel),
+    # so uninitialized reads cannot happen and empty is safe.
+    mid = torch.empty(num_seqs * num_heads, num_splits, head_dim + 2,
                       dtype=torch.float32, device=q.device)
-    mid[:, :, 0] = float("-inf")
     _paged_attn_decode_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, o, mid,
         block_tables, context_lens,
@@ -443,10 +451,15 @@ def _paged_attn_decode_int8_kernel(
     l_i = tl.zeros((1,), dtype=tl.float32)
     acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
 
-    # Flash-decoding segment partition (see BF16 kernel note).
-    seg_len = tl.cdiv(tl.cdiv(context_len, BLOCK_N), NUM_SPLITS) * BLOCK_N
-    n_lo = split_idx * seg_len
-    n_hi = tl.minimum(n_lo + seg_len, context_len)
+    # Flash-decoding segment partition (see BF16 kernel note). The constexpr
+    # single-split branch keeps the original constant loop lower bound.
+    if NUM_SPLITS == 1:
+        n_lo = 0
+        n_hi = context_len
+    else:
+        seg_len = tl.cdiv(tl.cdiv(context_len, BLOCK_N), NUM_SPLITS) * BLOCK_N
+        n_lo = split_idx * seg_len
+        n_hi = tl.minimum(n_lo + seg_len, context_len)
 
     for n_start in range(n_lo, n_hi, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)                       # global (mask)
@@ -552,11 +565,9 @@ def triton_paged_attention_int8(
         )
         return o
 
-    # See the BF16 wrapper: pre-poison mid to empty-split state so unwritten
-    # slots can never leak uninitialized NaN bits into the reduce.
-    mid = torch.zeros(num_seqs * num_heads, num_splits, head_dim + 2,
+    # See the BF16 wrapper: every split slot is written unconditionally.
+    mid = torch.empty(num_seqs * num_heads, num_splits, head_dim + 2,
                       dtype=torch.float32, device=q.device)
-    mid[:, :, 0] = float("-inf")
     _paged_attn_decode_int8_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, k_scale, v_scale, o, mid,
         block_tables, context_lens,
