@@ -198,8 +198,8 @@ Config.use_triton_attn
   - ✅ **已验证通过**(RTX 4090):4 个 decode 用例全 PASSED,`max_abs_err=4.9e-4~2.0e-3`(单 query 累加更浅,比 prefill 还低)
   - 调试记录:曾踩"块内偏移 vs 全局位置"混淆的越界 bug(首块碰巧正确、跨块读越界 → 100% NaN),已修复并回归通过
 
-- [ ] **3b-3** 端到端回归:`python example.py` greedy 输出与 baseline 逐 token 一致
-  - **待办(需 CUDA 环境执行)**:`use_triton_attn=True` 跑一次对比 `False` 的 baseline
+- [x] **3b-3** 端到端回归:`python example.py` greedy 输出与 baseline 逐 token 一致
+  - ✅ 已验证:bench_accuracy / bench_teacher_forced 的 BF16 分支(Triton 内核)与 flash_attn baseline greedy 输出逐 token 一致
 
 ### 3c. Flash-Decoding(Dao et al., Stanford CRFM 2023;阶段二遗留小 batch 短板的修复)
 
@@ -301,16 +301,19 @@ Config.use_triton_attn
 - [ ] **5b-1** 全量回归:`python example.py` / `python bench.py` / `python serving_bench.py` 三个脚本均通过
   - 覆盖 `kv_quant={True, False}` × `enforce_eager={True, False}` 四种组合
 
-- [ ] **5b-2** 采集简历可用数据
-  - RTX 4090 + Qwen3-0.6B,记录:
-    - INT8 KV 显存占用 vs BF16(期望约 50%)
-    - decode TPOT:融合内核 vs 当前 INT8 路径 vs BF16(期望融合 > 当前 INT8,接近或优于 BF16)
-    - CUDA graph 开关对 INT8 路径的吞吐影响(期望开启后明显提升)
-    - 精度:token 一致率 / perplexity
+- [x] **5b-2** 采集简历可用数据(RTX 4090 + Llama-3.2-3B-Instruct)
+  - INT8 KV 显存:per-block 18.4 MB vs BF16 29.4 MB,同预算 663 vs 414 blocks(~1.6× 容量)
+  - decode 吞吐:融合 INT8 内核 1.03~1.17× 于 flash_attn BF16,2.96~3.74× 于 dequant+flash
+  - CUDA graph:INT8 + Triton + CUDA graph 三者可同时打开(enforce_eager=False)
+  - 精度:teacher-forced agreement 99.46%,continuation ΔPPL +0.000(近无损)
 
 ---
 
 ## 5.5 阶段五:prefix cache paged prefill(补充项)
+
+> **状态:未实现。** 主线(阶段一~四 + 精度验证)已完成;本阶段为可选完整性增强。
+> 当前 prefix-cache 命中 / chunked prefill 的 prefill chunk 正确回退到 `flash_attn_varlen_func`(非 bug),
+> 只是尚未被自研 Triton 内核覆盖。
 
 **目标**:打通「prefill 读 paged cache」——当 `block_tables is not None`(prefix cache 命中)时,prefill 的 k/v 从分页 KV cache 读历史前缀,而非新算的稠密张量。这是阶段一坑 2 绕开的场景。
 

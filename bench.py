@@ -19,7 +19,7 @@ def main():
 
     # Toggle chunked prefill: set to True to interleave prefill chunks with decode.
     enable_chunked_prefill = False
-    # Toggle INT8 KV cache quantization (~48% memory reduction).
+    # Toggle INT8 KV cache quantization (~37% per-block memory, ~1.6x capacity).
     kv_quant = False
     # Toggle token-bucketed CUDA Graph for single-sequence prefill.
     enable_prefill_cudagraph = False

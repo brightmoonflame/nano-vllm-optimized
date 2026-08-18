@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefill-chunk-size", type=int, default=1024,
                         help="Number of prefill tokens per chunk when chunked prefill is enabled.")
     parser.add_argument("--kv-quant", action="store_true",
-                        help="Enable INT8 KV cache quantization (~48%% memory reduction).")
+                        help="Enable INT8 KV cache quantization (~37% per-block memory, ~1.6x capacity).")
     parser.add_argument("--use-triton-attn", action="store_true",
                         help="Use the self-researched Triton attention kernels instead of the flash_attn package.")
     parser.add_argument("--warmup-requests", type=int, default=1)

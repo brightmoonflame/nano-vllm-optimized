@@ -10,7 +10,7 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
 5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
 6. **Chunked prefill**: an `enable_chunked_prefill` flag in `Config` splits long prompts into chunks that interleave with decode in the same step. Pure-decode steps automatically fall back to CUDA Graph, so TPOT stays unchanged while TTFT drops 32×. Run `python bench_chunked.py` to compare ON vs OFF.
-7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head, group) symmetric Min-Max scaling — head_dim is split into 8 groups of 16 dims, each with its own dynamic scale, so outlier dimensions no longer crush the precision of the other dims. Combined with the self-researched Triton fused-dequant kernel (item 9), decode reads the INT8 cache directly (no whole-cache dequant pass), so memory *and* throughput both improve — see the Triton Attention Kernels section.
+7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head, group) symmetric Min-Max scaling — head_dim is split into 8 groups of 16 dims, each with its own dynamic scale, so outlier dimensions no longer crush the precision of the other dims. Combined with the self-researched Triton fused-dequant kernel (item 9), decode reads the INT8 cache directly (no whole-cache dequant pass), so memory *and* throughput both improve. Teacher-forced eval verifies it is near-lossless (continuation ΔPPL **+0.000**) — see the Triton Attention Kernels section.
 8. **Speculative decoding (EAGLE3)**: a chain-style EAGLE3 draft head (single Transformer decoder layer conditioned on low/mid/high target-layer features) proposes K candidate tokens that a standard rejection sampler verifies against the target in one pass. Supports greedy and temperature/top-k/top-p sampling; greedy output is token-for-token identical to non-spec decoding. Run `python bench_spec_decode.py`; see the [Speculative Decoding](#speculative-decoding-eagle3) section for numbers.
 9. **Self-researched Triton attention kernels**: FlashAttention-2 prefill (causal + GQA + varlen), paged-attention decode, a fused INT8 dequant decode kernel, and Flash-Decoding (split-K). Gated behind a `use_triton_attn` flag (default off, `flash_attn` package untouched). See the [Triton Attention Kernels](#triton-attention-kernels) section for benchmarks.
 
@@ -212,9 +212,9 @@ The 32× TTFT reduction comes from interleaving: the first request only needs to
 | KV cache | Per-block memory | Blocks | Concurrent capacity |
 | --- | ---: | ---: | ---: |
 | BF16 (default) | 29.4 MB | 414 | 1× |
-| INT8 (`kv_quant=True`) | **15.1 MB (-48%)** | **803 (+94%)** | **~2×** |
+| INT8 (`kv_quant=True`) | **18.4 MB (-37%)** | **663 (+60%)** | **~1.6×** |
 
-INT8 quantization halves per-block memory, doubling the number of sequences (or max context length) the GPU can hold. With the fused Triton dequant kernel, this no longer costs throughput — see below.
+INT8 cuts per-block memory to ~63% of BF16, fitting ~1.6× the blocks (and therefore ~1.6× the max context or concurrent sequences) into the same GPU budget. The ratio is 1.6× rather than 2× because the group-wise scales add overhead: each (token, head) costs 128 B (INT8 data) + 32 B (8 × FP32 scales) = 160 B vs 256 B for BF16. With the fused Triton dequant kernel, this no longer costs throughput — see below.
 
 #### CUDA Graph (`serving_bench.py` + `bench_prefill_graph.py`)
 
@@ -261,11 +261,30 @@ Hardware: Llama-3.2-3B-Instruct (24 Q / 8 KV heads, GQA 3:1), single RTX 4090.
 
 ### Memory
 
-`bench_memory.py`: INT8 KV cache holds **~2× the blocks/tokens** of BF16 under the same GPU budget (803 vs 414 blocks on Llama-3.2-3B).
+`bench_memory.py`: under the same GPU budget, the INT8 KV cache holds **~1.6× the blocks/tokens** of BF16 (663 vs 414 blocks on Llama-3.2-3B) — see the INT8 KV cache quantization section above for the per-block breakdown.
 
 ### Accuracy
 
-`bench_accuracy.py`: greedy output of `kv_quant=True` vs `kv_quant=False` (both on Triton kernels) — reports exact-match rate and token-match rate.
+Two complementary metrics on Llama-3.2-3B-Instruct (16 prompts, 128-token continuations):
+
+**Teacher-forced (cascade-free) — the number that matters.** `bench_teacher_forced.py` feeds both models the *same* reference continuation (the BF16 model's own greedy output) and scores only the next-token prediction at each step, so the contexts never diverge:
+
+| Metric | Result |
+| --- | ---: |
+| next-token agreement (INT8 vs BF16) | **99.46%** (2022/2033) |
+| continuation PPL — BF16 / INT8 | 1.259 / 1.259 (Δ **+0.000**) |
+
+ΔPPL ≈ 0 means the INT8 KV cache is effectively lossless — the standard result to cite (KVQuant targets < 0.1 ΔPPL for 4-bit; 8-bit is well inside that). A BF16-vs-its-own-reference self-check runs at 99.70% (driver sanity; the residual is kernel reduction-order noise between batch sizes).
+
+**Free-running greedy (`bench_accuracy.py`) — pessimistic by design.** Greedy decoding is autoregressive: a single early argmax flip changes the context for every later token, after which the two sequences generate different-but-valid continuations that all score as mismatches. That cascade makes a near-lossless quantizer look ~85%:
+
+| Metric | Result |
+| --- | ---: |
+| exact-match rate | 68.8% (11/16) |
+| token-match rate | 85.19% |
+| avg tokens before first divergence | 107.9 / 128 |
+
+Together they show the INT8 cache is near-lossless *per step* (99.46%); the ~85% figure is an artifact of greedy cascade, not quantization error.
 
 ### CUDA Graph
 
@@ -278,6 +297,7 @@ python bench_triton_prefill.py
 python bench_triton_decode.py
 python bench_memory.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct
+python bench_teacher_forced.py --model /root/model/Llama-3.2-3B-Instruct
 python serving_bench.py --model /root/model/Llama-3.2-3B-Instruct --mode offline --use-triton-attn --kv-quant
 ```
 
