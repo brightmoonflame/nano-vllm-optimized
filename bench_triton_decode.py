@@ -18,7 +18,9 @@ import time
 import torch
 from flash_attn import flash_attn_with_kvcache
 
-from nanovllm.layers.triton_attn import triton_paged_attention, triton_paged_attention_int8
+from nanovllm.layers.triton_attn import (
+    triton_paged_attention, triton_paged_attention_int8, _num_splits_for,
+)
 from nanovllm.layers.kv_quant import dequant_kvcache
 
 DEVICE = "cuda"
@@ -77,9 +79,10 @@ def bench(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
     t_tri = _median_ms(tri)
     ratio = t_tri / t_ref
     pct = 100.0 / ratio
+    splits = _num_splits_for(num_seqs, num_heads)
     print(f"ctx={ctx_len:>5}  batch={num_seqs:>4}  "
           f"flash_attn={t_ref:7.3f}ms  triton={t_tri:7.3f}ms  "
-          f"ratio={ratio:5.2f}x  (triton={pct:5.1f}% of flash_attn)")
+          f"ratio={ratio:5.2f}x  (triton={pct:5.1f}% of flash_attn)  [splits={splits}]")
     return ratio
 
 

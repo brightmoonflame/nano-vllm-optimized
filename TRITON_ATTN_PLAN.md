@@ -201,6 +201,24 @@ Config.use_triton_attn
 - [ ] **3b-3** 端到端回归:`python example.py` greedy 输出与 baseline 逐 token 一致
   - **待办(需 CUDA 环境执行)**:`use_triton_attn=True` 跑一次对比 `False` 的 baseline
 
+### 3c. Flash-Decoding(Dao et al., Stanford CRFM 2023;阶段二遗留小 batch 短板的修复)
+
+> **背景**:bench 显示自研 decode 内核在 batch=1/8 时落后 `flash_attn_with_kvcache` 2.1~2.4x。
+> 根因:单 query 串行扫 KV,grid=(seq,head) 并行度不足(batch=1×24 heads 仅占 4090 的 19% SM)。
+> `flash_attn_with_kvcache` 内部本身就实现了 flash-decoding,这正是其小 batch 也快的原因。
+> FlashInfer(vLLM 生态)同样采用 split + merge 两阶段结构。minivllm 没有此技术 → 这是相对参考实现的差异化增量。
+
+- [x] **3c-1** 改造两个 decode 内核(BF16 + INT8)加 split-K,而非新增独立内核
+  - kernel 新增 `NUM_SPLITS`/`WRITE_MID` constexpr + `tl.program_id(2)` split 维
+  - 段划分:`seg_len = cdiv(cdiv(ctx,BLOCK_N),NUM_SPLITS)*BLOCK_N`(对齐 tile,不跨段);空段保持初始 `(-inf,0,0)` 状态,归约时 `exp(-inf-m)=0` 自然零贡献,无需特判
+  - `WRITE_MID=True`:写未归一化 `(m,l,acc)` 到 mid buffer `(seq*head, splits, head_dim+2)` fp32;`WRITE_MID=False`(单段):直接写最终输出,**大 batch 路径零开销**(编译期裁剪)
+- [x] **3c-2** 共享归约内核 `_split_reduce_kernel`:标准 max-rescale 公式 `m_g=max_s m_s; out=Σr_s·acc_s / Σr_s·l_s`,BF16/INT8 共用(mid 布局相同)
+- [x] **3c-3** wrapper 自动决策 `_num_splits_for(batch, heads)`:`target = SM数×4`,round up 到 2 的幂(reduce 的 tl.arange 要求);仅静态输入,**无 GPU→CPU 同步,CUDA graph 友好**
+  - batch=1 → 32 splits(768 programs),batch=8 → 4,batch≥32 → 1(退化回原单段路径)
+  - wrapper 签名不变,`attention.py` 零改动;`num_splits` 可显式传入(bench/测试用)
+- [x] **3c-4** 测试:split 一致性用例(`splits=1` vs `64`,300 tokens/5 tiles vs 64 splits → 59 个空段被显式覆盖),BF16 + INT8 各一
+  - **待办(需 CUDA 环境执行)**:跑全量测试 + bench(重点看 batch=1/8 行的 ratio 与 [splits=N] 标注)
+
 ---
 
 ## 4. 阶段三:INT8 KV 融合反量化(核心增量)

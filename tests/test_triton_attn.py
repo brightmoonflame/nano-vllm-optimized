@@ -206,6 +206,61 @@ def test_decode_int8_gqa_4to1_long():
     _run_decode_int8_case("decode_int8_gqa_4to1(4096)", num_heads=16, num_kv_heads=4, head_dim=128, ctx_lens=[4096])
 
 
+def _run_splitk_consistency(name, num_heads, num_kv_heads, head_dim, ctx_len,
+                            block_size=256, splits: int = 64):
+    """Flash-decoding correctness: multi-split output must equal single-split.
+
+    The KV partition + reduce is mathematically equivalent to one sequential
+    pass, so outputs must match to float-rounding regardless of split count.
+    Empty splits (split range beyond ctx_len) contribute zero — this also
+    exercises that path since splits=64 > ceil(ctx_len/BLOCK_N) tiles.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    scale = head_dim ** -0.5
+    num_seqs = 1
+
+    block_tables = torch.tensor([[0]], dtype=torch.int32, device=device)
+    k_cache = torch.randn(1, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    v_cache = torch.randn(1, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(num_seqs, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    context_lens = torch.tensor([ctx_len], dtype=torch.int32, device=device)
+
+    single = triton_paged_attention(q, k_cache, v_cache, block_tables, context_lens, scale, num_splits=1)
+    multi = triton_paged_attention(q, k_cache, v_cache, block_tables, context_lens, scale, num_splits=splits)
+
+    max_abs_err = (multi - single).abs().max().item()
+    torch.testing.assert_close(multi, single, atol=1e-2, rtol=1e-2)
+    _log(f"[{name}] PASSED  splits=1 vs {splits}  max_abs_err={max_abs_err:.4e}")
+
+
+def test_decode_splitk_consistency():
+    # 300 tokens / BLOCK_N=64 = 5 tiles vs 64 splits → 59 empty splits exercised.
+    _run_splitk_consistency("splitk_bf16(300,64splits)", num_heads=24, num_kv_heads=8, head_dim=128, ctx_len=300)
+
+
+def test_decode_splitk_consistency_int8():
+    torch.manual_seed(0)
+    device = "cuda"
+    num_heads, num_kv_heads, head_dim, ctx_len = 24, 8, 128, 300
+    scale = head_dim ** -0.5
+
+    block_tables = torch.tensor([[0]], dtype=torch.int32, device=device)
+    k_bf16 = torch.randn(1, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    v_bf16 = torch.randn(1, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_i8, k_sc = _quantize_cache(k_bf16)
+    v_i8, v_sc = _quantize_cache(v_bf16)
+    q = torch.randn(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    context_lens = torch.tensor([ctx_len], dtype=torch.int32, device=device)
+
+    single = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale, num_splits=1)
+    multi = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale, num_splits=64)
+
+    max_abs_err = (multi - single).abs().max().item()
+    torch.testing.assert_close(multi, single, atol=1e-2, rtol=1e-2)
+    _log(f"[splitk_int8(300,64splits)] PASSED  splits=1 vs 64  max_abs_err={max_abs_err:.4e}")
+
+
 if __name__ == "__main__":
     test_mha_short()
     test_mha_multi_seq_uneven()
@@ -219,4 +274,6 @@ if __name__ == "__main__":
     test_decode_int8_multi_seq_uneven()
     test_decode_int8_gqa_3to1()
     test_decode_int8_gqa_4to1_long()
-    print("All precision tests passed (prefill FA2 + decode paged + decode INT8 fused).", flush=True)
+    test_decode_splitk_consistency()
+    test_decode_splitk_consistency_int8()
+    print("All precision tests passed (prefill FA2 + decode paged + INT8 fused + flash-decoding).", flush=True)
