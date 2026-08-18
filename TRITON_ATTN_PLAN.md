@@ -217,7 +217,14 @@ Config.use_triton_attn
   - batch=1 → 32 splits(768 programs),batch=8 → 4,batch≥32 → 1(退化回原单段路径)
   - wrapper 签名不变,`attention.py` 零改动;`num_splits` 可显式传入(bench/测试用)
 - [x] **3c-4** 测试:split 一致性用例(`splits=1` vs `64`,300 tokens/5 tiles vs 64 splits → 59 个空段被显式覆盖),BF16 + INT8 各一
-  - **待办(需 CUDA 环境执行)**:跑全量测试 + bench(重点看 batch=1/8 行的 ratio 与 [splits=N] 标注)
+  - ✅ 已验证:14 用例全过,split 一致性 `err=0`(真阳性,合法输入+乱序物理块)
+  - 性能调优记录(三轮):① `get_device_properties` 热路径缓存 ② `if NUM_SPLITS==1` 编译期分支保留常量循环下界 ③ 撤销误加的 mid 预填充 → 大 batch 完全恢复原水平
+
+- [ ] **3c-5** (已知限制,后续统一优化)小 batch 未达预期:split-K 后 batch=1/8 仍落后 `flash_attn` ~1.9x(从 2.4x 改善)
+  - 根因(结构性,非 bug):① 两 kernel(split+reduce)固定 launch 开销 + 每次 `torch.empty` mid 分配 ② 每 program 仅 1 个 tile(64 tokens),load latency 无法隐藏,无循环流水线
+  - 对比:flash_attn 用 CUDA persistent kernel(单 kernel 内 split+归约,大 tile,warp 分工)
+  - 待优化方向:persistent kernel / 预分配 mid buffer 复用 / 更大 BLOCK_N 减少 tile 数;收益递减,暂缓
+  - 当前结论:大 batch 打平、INT8 全面反超(核心目标达成),小 batch 1.9x 作为已知限制记录
 
 ---
 
