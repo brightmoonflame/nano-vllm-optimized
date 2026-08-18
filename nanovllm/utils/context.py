@@ -12,6 +12,9 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    # Eval-only (teacher-forced accuracy): when True, ParallelLMHead returns
+    # logits at ALL positions instead of slicing to each seq's last position.
+    full_logits: bool = False
 
 _CONTEXT = Context()
 

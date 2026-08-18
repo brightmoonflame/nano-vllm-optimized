@@ -512,6 +512,29 @@ class ModelRunner:
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
+    def run_teacher_forced(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor:
+        """Teacher-forced forward used only by the accuracy eval path.
+
+        Unlike `run`: performs NO sampling/argmax and returns the raw next-token
+        logits. For prefill it returns per-position logits for the whole
+        (packed) prompt — (total_tokens, vocab) — via the `full_logits` context
+        flag, so the caller can score the continuation of every position. For
+        decode it returns the single forced token's logits (num_seqs, vocab).
+
+        Callers drive scheduler state themselves (this method does not touch
+        Sequence bookkeeping beyond what prepare_* reads).
+        """
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+        context = get_context()
+        context.full_logits = True
+        logits = self.model.compute_logits(self._target_forward(input_ids, positions))
+        reset_context()
+        return logits
+
     def _can_replay_prefill_graph(self, input_ids: torch.Tensor) -> bool:
         """Prefill graphs safely support one non-prefix sequence per replay.
 
