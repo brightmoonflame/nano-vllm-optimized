@@ -508,6 +508,7 @@ def _paged_attn_decode_int8_kernel(
         n_lo = split_idx * seg_len
         n_hi = tl.minimum(n_lo + seg_len, context_len)
 
+    offs_g = tl.arange(0, NUM_GROUPS)
     for n_start in range(n_lo, n_hi, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)                       # global (mask)
         mask_n = offs_n < context_len
@@ -520,8 +521,8 @@ def _paged_attn_decode_int8_kernel(
                  + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
         k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
         ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
-                     + offs_in_block * stride_ksc_t + kv_head_idx * NUM_GROUPS,
-                     mask=mask_n, other=0.0)                            # (BLOCK_N, NUM_GROUPS)
+                     + offs_in_block[:, None] * stride_ksc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                     mask=mask_n[:, None], other=0.0)                   # (BLOCK_N, NUM_GROUPS)
         # (BLOCK_N, G, 1) → broadcast (BLOCK_N, G, GROUP_SIZE) → (BLOCK_N, HEAD_DIM):
         # element d uses the scale of its group d // GROUP_SIZE.
         ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
@@ -540,8 +541,8 @@ def _paged_attn_decode_int8_kernel(
                  + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
         v_i8 = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
         vs = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
-                     + offs_in_block * stride_vsc_t + kv_head_idx * NUM_GROUPS,
-                     mask=mask_n, other=0.0)
+                     + offs_in_block[:, None] * stride_vsc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                     mask=mask_n[:, None], other=0.0)
         vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
                              (BLOCK_N, HEAD_DIM))
 
