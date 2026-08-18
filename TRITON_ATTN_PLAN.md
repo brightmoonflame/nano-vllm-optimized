@@ -293,7 +293,8 @@ Config.use_triton_attn
   - 附带收益:消除每步 decode 的 `torch.empty`(3c-5 记录的开销源之一)
   - warmup 路径:capture 前 warmup 走 decode Triton 分支 + 预分配 buffer,天然覆盖 `triton_paged_attention_int8`
 
-- [ ] **5a-3** 验证(需 CUDA 环境):`kv_quant=True + use_triton_attn=True + enforce_eager=False` 下 `example.py` capture 成功且输出正确
+- [x] **5a-3** 验证(RTX 4090):`kv_quant=True + use_triton_attn=True + enforce_eager=False` 下 `example.py` capture 成功,输出与 eager 逐字一致
+  - ✅ 三者同时打开:INT8 KV cache + 自研 Triton 融合内核 + CUDA graph,计划核心愿景达成
 
 ### 5b. 最终回归与简历数据采集
 
