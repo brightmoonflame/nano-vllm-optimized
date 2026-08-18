@@ -137,10 +137,22 @@ def test_decode_gqa_4to1_long():
     _run_decode_case("decode_gqa_4to1(4096)", num_heads=16, num_kv_heads=4, head_dim=128, ctx_lens=[4096])
 
 
-def _quantize_cache(bf16_cache: torch.Tensor):
-    """Per-(token, head) symmetric min-max quantization, mirroring
-    store_kvcache_int8_kernel: scale = max|.|/127, int8 = round(x/scale)."""
-    sc = bf16_cache.float().abs().amax(dim=-1) / 127.0
+def _quantize_k_cache(bf16_cache: torch.Tensor):
+    """K: per-head symmetric quantization (scale shared across all tokens).
+
+    Mirrors the static per-head K scale (keeps cross-token softmax consistency).
+    bf16_cache: (blocks, block_size, kv_heads, head_dim) → scale (kv_heads,).
+    """
+    sc = bf16_cache.float().abs().amax(dim=(0, 1, 3)) / 127.0          # (kv_heads,)
+    sc = sc.clamp(min=1e-6)
+    i8 = torch.round(bf16_cache.float() / sc[None, None, :, None]).clamp(-127, 127).to(torch.int8)
+    return i8, sc
+
+
+def _quantize_v_cache(bf16_cache: torch.Tensor):
+    """V: per-(token, head) symmetric min-max quantization (mirrors
+    store_kvcache_int8_kernel): scale = max|.|/127, int8 = round(x/scale)."""
+    sc = bf16_cache.float().abs().amax(dim=-1) / 127.0                 # (blocks, block_size, kv_heads)
     sc = sc.clamp(min=1e-6)
     i8 = torch.round(bf16_cache.float() / sc[..., None]).clamp(-127, 127).to(torch.int8)
     return i8, sc
@@ -164,8 +176,8 @@ def _run_decode_int8_case(name, num_heads, num_kv_heads, head_dim, ctx_lens,
         ptr += nb
     block_tables = torch.tensor(rows, dtype=torch.int32, device=device)
 
-    k_i8, k_sc = _quantize_cache(torch.randn(total_logical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
-    v_i8, v_sc = _quantize_cache(torch.randn(total_logical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
+    k_i8, k_sc = _quantize_k_cache(torch.randn(total_logical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
+    v_i8, v_sc = _quantize_v_cache(torch.randn(total_logical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
     q = torch.randn(num_seqs, num_heads, head_dim, dtype=dtype, device=device)
     context_lens = torch.tensor(ctx_lens, dtype=torch.int32, device=device)
 
@@ -173,7 +185,7 @@ def _run_decode_int8_case(name, num_heads, num_kv_heads, head_dim, ctx_lens,
     # whole-cache dequant to BF16, then flash_attn. The fused kernel shares
     # this numeric path (int8 × scale), so outputs should match closely.
     _log(f"[{name}] running dequant + flash_attn_with_kvcache (reference) ...")
-    k_bf16 = dequant_kvcache(k_i8, k_sc)
+    k_bf16 = dequant_kvcache(k_i8, k_sc, per_head=True)
     v_bf16 = dequant_kvcache(v_i8, v_sc)
     ref = flash_attn_with_kvcache(
         q.unsqueeze(1), k_bf16, v_bf16,
@@ -257,8 +269,8 @@ def test_decode_splitk_consistency_int8():
     block_tables = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
     k_bf16 = torch.randn(2, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     v_bf16 = torch.randn(2, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
-    k_i8, k_sc = _quantize_cache(k_bf16)
-    v_i8, v_sc = _quantize_cache(v_bf16)
+    k_i8, k_sc = _quantize_k_cache(k_bf16)
+    v_i8, v_sc = _quantize_v_cache(v_bf16)
     q = torch.randn(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     context_lens = torch.tensor([ctx_len], dtype=torch.int32, device=device)
 

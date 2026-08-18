@@ -50,7 +50,10 @@ def _num_splits_for(num_seqs: int, num_heads: int) -> int:
     global _NUM_SMS
     if _NUM_SMS is None:
         _NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    want = max(1, -(-(_NUM_SMS * 4) // (num_seqs * num_heads)))
+    # Target 2 programs/SM (not 4): each split then handles 2+ tiles, giving the
+    # loop enough iterations to pipeline loads (1-tile splits expose full load
+    # latency). Fewer, fatter splits measured faster than many 1-tile splits.
+    want = max(1, -(-(_NUM_SMS * 2) // (num_seqs * num_heads)))
     return 1 << (want - 1).bit_length()
 
 
@@ -65,7 +68,7 @@ def mid_buffer_size(num_heads: int, head_dim: int, max_bs: int) -> int:
     global _NUM_SMS
     if _NUM_SMS is None:
         _NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-    target = _NUM_SMS * 4
+    target = _NUM_SMS * 2
     best = 0
     for bs in range(1, max_bs + 1):
         p = bs * num_heads
@@ -450,7 +453,6 @@ def _paged_attn_decode_int8_kernel(
     stride_qn, stride_qh,
     stride_kb, stride_kt, stride_kh,
     stride_vb, stride_vt, stride_vh,
-    stride_ksc_b, stride_ksc_t,
     stride_vsc_b, stride_vsc_t,
     stride_on, stride_oh,
     stride_mid_sh, stride_mid_ss,
@@ -467,10 +469,10 @@ def _paged_attn_decode_int8_kernel(
     dequantizes in-register — no whole-cache dequant pass, no intermediate
     BF16 buffer. Used when kv_quant=True and use_triton_attn=True.
 
-    Per-(token, head) symmetric quantization lets the scale float out of the
-    dot product (scale is constant along head_dim), so we compute in int8 and
-    post-multiply the scale once per token instead of rescaling every element:
-        qk[t]  = k_scale[t] * softmax_scale * Σ_d q[d]·k_int8[t,d]
+    K uses a static per-head scale (shared across tokens, preserving softmax
+    consistency); V uses a per-(token, head) scale. Both float out of the dot
+    product (constant along head_dim), so we compute in int8 and post-multiply:
+        qk[t]  = k_scale[head] * softmax_scale * Σ_d q[d]·k_int8[t,d]
         acc[d] += (p[t]·v_scale[t]) * v_int8[t,d]
     """
     seq_idx = tl.program_id(0)
@@ -498,6 +500,9 @@ def _paged_attn_decode_int8_kernel(
         n_lo = split_idx * seg_len
         n_hi = tl.minimum(n_lo + seg_len, context_len)
 
+    # K's per-head scale is a scalar shared by every token in the segment.
+    k_sc = tl.load(k_scale_ptr + kv_head_idx)
+
     for n_start in range(n_lo, n_hi, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)                       # global (mask)
         mask_n = offs_n < context_len
@@ -505,15 +510,12 @@ def _paged_attn_decode_int8_kernel(
 
         physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
 
-        # --- K: int8 dot product in fp32, then per-(token, head) scale ---
+        # --- K: int8 dot product in fp32, then the shared per-head scale ---
         k_off = (physical_block.to(tl.int64) * stride_kb
                  + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
         k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
         qk = tl.sum(q[None, :] * k_i8.to(tl.float32), axis=1)
 
-        k_sc = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
-                       + offs_in_block * stride_ksc_t + kv_head_idx,
-                       mask=mask_n, other=0.0)   # 0.0: unmasked garbage may be NaN → 0*x stays safe
         qk = qk * k_sc * scale
         qk = tl.where(mask_n, qk, float("-inf"))
 
@@ -552,8 +554,8 @@ def triton_paged_attention_int8(
     q: torch.Tensor,             # (num_seqs, num_heads, head_dim) BF16
     k_cache: torch.Tensor,       # (num_blocks, block_size, num_kv_heads, head_dim) INT8
     v_cache: torch.Tensor,       # same layout as k_cache, INT8
-    k_scale: torch.Tensor,       # (num_blocks, block_size, num_kv_heads) FP32
-    v_scale: torch.Tensor,       # same layout as k_scale
+    k_scale: torch.Tensor,       # (num_kv_heads,) FP32 static per-head
+    v_scale: torch.Tensor,       # (num_blocks, block_size, num_kv_heads) FP32 per-token
     block_tables: torch.Tensor,  # (num_seqs, max_num_blocks) int32
     context_lens: torch.Tensor,  # (num_seqs,) int32
     scale: float,
@@ -571,7 +573,8 @@ def triton_paged_attention_int8(
     assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
     assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
     assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1
-    assert k_scale.stride(-1) == 1 and v_scale.stride(-1) == 1
+    assert k_scale.ndim == 1 and k_scale.numel() == num_kv_heads, "k_scale must be per-head"
+    assert v_scale.stride(-1) == 1
 
     BLOCK_N = 64    # divides block_size (256), so one tile never spans two cache blocks
     assert block_size % BLOCK_N == 0
@@ -587,7 +590,6 @@ def triton_paged_attention_int8(
             q.stride(0), q.stride(1),
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-            k_scale.stride(0), k_scale.stride(1),
             v_scale.stride(0), v_scale.stride(1),
             o.stride(0), o.stride(1),
             0, 0,                                         # mid strides unused
@@ -612,7 +614,6 @@ def triton_paged_attention_int8(
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        k_scale.stride(0), k_scale.stride(1),
         v_scale.stride(0), v_scale.stride(1),
         o.stride(0), o.stride(1),
         mid.stride(0), mid.stride(1),

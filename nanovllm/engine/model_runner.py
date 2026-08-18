@@ -17,6 +17,7 @@ from nanovllm.models.llama import LlamaForCausalLM
 from nanovllm.models.gemma3 import Gemma3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.layers.triton_attn import mid_buffer_size
+from nanovllm.layers.kv_quant import calibrate_k_scales
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.spec_decode.metadata import make_spec_decode_metadata
@@ -57,6 +58,11 @@ class ModelRunner:
         for module in self.model.modules():
             if hasattr(module, "k_cache"):
                 module.use_triton_attn = config.use_triton_attn
+        # K uses a static per-head scale (shared across tokens to keep softmax
+        # scores consistent); calibrate it once before any store happens.
+        if config.kv_quant:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            self.k_scales = calibrate_k_scales(self.model, hf_config.num_hidden_layers, num_kv_heads)
         self.sampler = Sampler()
         # Draft model is a standalone HF model (not TP-sharded), so only rank 0
         # proposes + rejection-samples; other ranks only run the target forward.
@@ -179,8 +185,9 @@ class ModelRunner:
         elem_size = 1 if config.kv_quant else hf_config.dtype.itemsize
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * elem_size
         if config.kv_quant:
-            # FP32 scale: 2 (k+v) × layers × block_size × num_kv_heads × 4 bytes
-            scale_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * 4
+            # V keeps a per-(token, head) scale (per block). K's static per-head
+            # scale is one-time and negligible (layers × kv_heads × 4 bytes).
+            scale_bytes = hf_config.num_hidden_layers * self.block_size * num_kv_heads * 4
             block_bytes += scale_bytes
 
         # Draft (EAGLE3) KV cache: 1 layer, always full precision (kv_quant
@@ -199,15 +206,16 @@ class ModelRunner:
         cache_dtype = torch.int8 if config.kv_quant else hf_config.dtype
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, dtype=cache_dtype)
         if config.kv_quant:
-            self.kv_scales = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, dtype=torch.float32)
+            # K: (num_layers, num_kv_heads) static per-head; V: per-(token, head).
+            self.v_scales = torch.empty(hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, dtype=torch.float32)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 if config.kv_quant:
-                    module.k_scale = self.kv_scales[0, layer_id]
-                    module.v_scale = self.kv_scales[1, layer_id]
+                    module.k_scale = self.k_scales[layer_id]
+                    module.v_scale = self.v_scales[layer_id]
                     module.kv_quant = True
                 layer_id += 1
 
@@ -221,7 +229,8 @@ class ModelRunner:
 
         kv_mb = self.kv_cache.numel() * self.kv_cache.element_size() / 1e6
         if config.kv_quant:
-            kv_mb += self.kv_scales.numel() * self.kv_scales.element_size() / 1e6
+            kv_mb += self.v_scales.numel() * self.v_scales.element_size() / 1e6
+            kv_mb += self.k_scales.numel() * self.k_scales.element_size() / 1e6
         if proposer is not None:
             kv_mb += self.draft_kv_cache.numel() * self.draft_kv_cache.element_size() / 1e6
         per_block_mb = kv_mb / config.num_kvcache_blocks

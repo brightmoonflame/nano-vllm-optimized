@@ -10,7 +10,7 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
 5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
 6. **Chunked prefill**: an `enable_chunked_prefill` flag in `Config` splits long prompts into chunks that interleave with decode in the same step. Pure-decode steps automatically fall back to CUDA Graph, so TPOT stays unchanged while TTFT drops 32×. Run `python bench_chunked.py` to compare ON vs OFF.
-7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head) symmetric Min-Max scaling, halving per-block memory. Combined with the self-researched Triton fused-dequant kernel (item 9), decode reads the INT8 cache directly (no whole-cache dequant pass), so memory *and* throughput both improve — see the Triton Attention Kernels section.
+7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 — K with a static per-head scale (kept shared across tokens so softmax scores stay consistent), V with a per-(token, head) symmetric Min-Max scale — halving per-block memory. Combined with the self-researched Triton fused-dequant kernel (item 9), decode reads the INT8 cache directly (no whole-cache dequant pass), so memory *and* throughput both improve — see the Triton Attention Kernels section.
 8. **Speculative decoding (EAGLE3)**: a chain-style EAGLE3 draft head (single Transformer decoder layer conditioned on low/mid/high target-layer features) proposes K candidate tokens that a standard rejection sampler verifies against the target in one pass. Supports greedy and temperature/top-k/top-p sampling; greedy output is token-for-token identical to non-spec decoding. Run `python bench_spec_decode.py`; see the [Speculative Decoding](#speculative-decoding-eagle3) section for numbers.
 9. **Self-researched Triton attention kernels**: FlashAttention-2 prefill (causal + GQA + varlen), paged-attention decode, a fused INT8 dequant decode kernel, and Flash-Decoding (split-K). Gated behind a `use_triton_attn` flag (default off, `flash_attn` package untouched). See the [Triton Attention Kernels](#triton-attention-kernels) section for benchmarks.
 
@@ -218,14 +218,14 @@ INT8 quantization halves per-block memory, doubling the number of sequences (or 
 
 #### CUDA Graph (`serving_bench.py` + `bench_prefill_graph.py`)
 
-**Decode CUDA Graph** (256 requests, 512-token inputs, 128-token outputs, serving 8 req/s):
+**Decode CUDA Graph** (256 requests, 512-token inputs, 128-token outputs, serving 8 req/s). The gain scales inversely with model size — launch overhead is a bigger fraction of per-step cost on small models:
 
-| Mode | Mean TPOT | Mean latency |
-| --- | ---: | ---: |
-| Eager (`--enforce-eager`) | 35.3 ms | 4567 ms |
-| CUDA Graph (default) | **3.7 ms (9.5×)** | **538 ms (8.5×)** |
+| Model | Eager TPOT | CUDA Graph TPOT | Speedup |
+| --- | ---: | ---: | ---: |
+| Qwen3-0.6B | 35.3 ms | 3.7 ms | **9.5×** |
+| Llama-3.2-3B | 42.3 ms | 40.0 ms | ~1.1× |
 
-Decode processes only 1 token per sequence per step, so kernel-launch overhead dominates. CUDA Graph eliminates this overhead, yielding a 9.5× TPOT improvement.
+Decode processes only 1 token per sequence per step, so kernel-launch overhead dominates on small models; on 3B the per-step compute is large enough that launch overhead shrinks to ~5–10%.
 
 **Prefill CUDA Graph** (Llama-3.2-1B, single request, `enforce_eager=True`):
 
