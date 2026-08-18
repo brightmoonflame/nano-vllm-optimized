@@ -214,15 +214,22 @@ def _run_splitk_consistency(name, num_heads, num_kv_heads, head_dim, ctx_len,
     pass, so outputs must match to float-rounding regardless of split count.
     Empty splits (split range beyond ctx_len) contribute zero — this also
     exercises that path since splits=64 > ceil(ctx_len/BLOCK_N) tiles.
+
+    NOTE: ctx=300 spans TWO logical blocks (256+44) — the block table needs a
+    column per logical block, and the cache needs a physical block per entry,
+    otherwise the kernel reads past the table (an earlier revision allocated
+    one block and got silent garbage / NaN; its bf16 "err=0" was two paths
+    reading the same garbage identically). Physical order is shuffled to
+    also exercise block_table addressing.
     """
     torch.manual_seed(0)
     device = "cuda"
     scale = head_dim ** -0.5
     num_seqs = 1
 
-    block_tables = torch.tensor([[0]], dtype=torch.int32, device=device)
-    k_cache = torch.randn(1, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
-    v_cache = torch.randn(1, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    block_tables = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
+    k_cache = torch.randn(2, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    v_cache = torch.randn(2, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     q = torch.randn(num_seqs, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     context_lens = torch.tensor([ctx_len], dtype=torch.int32, device=device)
 
@@ -245,9 +252,11 @@ def test_decode_splitk_consistency_int8():
     num_heads, num_kv_heads, head_dim, ctx_len = 24, 8, 128, 300
     scale = head_dim ** -0.5
 
-    block_tables = torch.tensor([[0]], dtype=torch.int32, device=device)
-    k_bf16 = torch.randn(1, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
-    v_bf16 = torch.randn(1, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    # Two physical blocks in shuffled order — ctx=300 spans two logical
+    # blocks, so the table must have two columns (see BF16 test note).
+    block_tables = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
+    k_bf16 = torch.randn(2, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    v_bf16 = torch.randn(2, 256, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
     k_i8, k_sc = _quantize_cache(k_bf16)
     v_i8, v_sc = _quantize_cache(v_bf16)
     q = torch.randn(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
