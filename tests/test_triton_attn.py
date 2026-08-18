@@ -256,7 +256,12 @@ def test_decode_splitk_consistency_int8():
     single = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale, num_splits=1)
     multi = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale, num_splits=64)
 
-    max_abs_err = (multi - single).abs().max().item()
+    diff = (multi - single).abs()
+    nan_mask = torch.isnan(diff)
+    if nan_mask.any():
+        bad_heads = torch.nonzero(nan_mask[0].any(dim=-1)).flatten().tolist()
+        _log(f"[splitk_int8] NaN in heads {bad_heads} / {num_heads}")
+    max_abs_err = diff.max().item()
     torch.testing.assert_close(multi, single, atol=1e-2, rtol=1e-2)
     _log(f"[splitk_int8(300,64splits)] PASSED  splits=1 vs 64  max_abs_err={max_abs_err:.4e}")
 

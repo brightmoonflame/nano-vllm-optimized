@@ -358,9 +358,15 @@ def triton_paged_attention(
         )
         return o
 
-    # Small batches: partition KV across splits, then reduce.
-    mid = torch.empty(num_seqs * num_heads, num_splits, head_dim + 2,
+    # Small batches: partition KV across splits, then reduce. The mid buffer
+    # is pre-poisoned to a mathematically-empty split state (m=-inf, l=0,
+    # acc=0): any slot a kernel instance fails to write (observed on one
+    # INT8 compiler specialization with many empty splits) then contributes
+    # exp(-inf - m_g) = 0 to the reduce instead of leaking uninitialized
+    # NaN bits through max()/exp().
+    mid = torch.zeros(num_seqs * num_heads, num_splits, head_dim + 2,
                       dtype=torch.float32, device=q.device)
+    mid[:, :, 0] = float("-inf")
     _paged_attn_decode_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, o, mid,
         block_tables, context_lens,
@@ -546,8 +552,11 @@ def triton_paged_attention_int8(
         )
         return o
 
-    mid = torch.empty(num_seqs * num_heads, num_splits, head_dim + 2,
+    # See the BF16 wrapper: pre-poison mid to empty-split state so unwritten
+    # slots can never leak uninitialized NaN bits into the reduce.
+    mid = torch.zeros(num_seqs * num_heads, num_splits, head_dim + 2,
                       dtype=torch.float32, device=q.device)
+    mid[:, :, 0] = float("-inf")
     _paged_attn_decode_int8_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, k_scale, v_scale, o, mid,
         block_tables, context_lens,
