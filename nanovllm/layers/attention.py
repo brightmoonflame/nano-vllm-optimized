@@ -110,7 +110,7 @@ class Attention(nn.Module):
                         mid=self.mid_buffer)
                 else:
                     # Default: whole-cache dequant + flash_attn (fallback baseline).
-                    k_bf16 = dequant_kvcache(k_cache, self.k_scale, per_head=True)
+                    k_bf16 = dequant_kvcache(k_cache, self.k_scale)
                     v_bf16 = dequant_kvcache(v_cache, self.v_scale)
                     o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
                                                 cache_seqlens=context.context_lens, block_table=context.block_tables,

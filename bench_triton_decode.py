@@ -29,19 +29,18 @@ WARMUP = 5
 REPEATS = 30
 
 
-def _quantize_k(bf16_cache: torch.Tensor):
-    """K: per-head symmetric quantization (scale shared across tokens)."""
-    sc = bf16_cache.float().abs().amax(dim=(0, 1, 3)) / 127.0          # (kv_heads,)
-    sc = sc.clamp(min=1e-6)
-    i8 = torch.round(bf16_cache.float() / sc[None, None, :, None]).clamp(-127, 127).to(torch.int8)
-    return i8, sc
+NUM_GROUPS = 8
 
 
-def _quantize_v(bf16_cache: torch.Tensor):
-    """V: per-(token, head) symmetric min-max quantization."""
-    sc = bf16_cache.float().abs().amax(dim=-1) / 127.0                 # (blocks, block_size, kv_heads)
+def _quantize_groupwise(bf16_cache: torch.Tensor):
+    """Per-(token, head, group) symmetric quantization (8 groups of 16 dims)."""
+    n, t, h, d = bf16_cache.shape
+    g = d // NUM_GROUPS
+    x = bf16_cache.float().reshape(n, t, h, NUM_GROUPS, g)
+    sc = x.abs().amax(dim=-1) / 127.0                                  # (n, t, h, NUM_GROUPS)
     sc = sc.clamp(min=1e-6)
-    i8 = torch.round(bf16_cache.float() / sc[..., None]).clamp(-127, 127).to(torch.int8)
+    sc_full = sc[..., None].expand(n, t, h, NUM_GROUPS, g).reshape(n, t, h, d)
+    i8 = torch.round(bf16_cache.float() / sc_full).clamp(-127, 127).to(torch.int8)
     return i8, sc
 
 
@@ -105,13 +104,13 @@ def bench_int8(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
     """
     q, k_cache, v_cache, block_tables, context_lens, scale = _make_inputs(
         ctx_len, num_seqs, num_heads, num_kv_heads)
-    k_i8, k_sc = _quantize_k(k_cache)
-    v_i8, v_sc = _quantize_v(v_cache)
+    k_i8, k_sc = _quantize_groupwise(k_cache)
+    v_i8, v_sc = _quantize_groupwise(v_cache)
 
     def dequant_flash():
         # Mirrors attention.py's default kv_quant branch: full-cache dequant
         # (all blocks, not just the ctx window) then flash_attn.
-        kb = dequant_kvcache(k_i8, k_sc, per_head=True)
+        kb = dequant_kvcache(k_i8, k_sc)
         vb = dequant_kvcache(v_i8, v_sc)
         return flash_attn_with_kvcache(
             q.unsqueeze(1), kb, vb,

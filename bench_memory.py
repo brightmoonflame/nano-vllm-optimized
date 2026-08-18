@@ -31,9 +31,8 @@ def measure(model: str, kv_quant: bool, gpu_memory_utilization: float) -> dict:
 
     block_mb = 2 * num_layers * block_size * num_kv_heads * head_dim * elem_size / 1e6
     if kv_quant:
-        # V keeps a per-(token, head) FP32 scale per block (K's per-head scale
-        # is one-time and negligible: layers × kv_heads × 4 bytes).
-        block_mb += num_layers * block_size * num_kv_heads * 4 / 1e6
+        # Group-wise FP32 scales (both K and V): NUM_GROUPS per token per head.
+        block_mb += 2 * num_layers * block_size * num_kv_heads * 8 * 4 / 1e6
     llm.exit()
     del llm
     gc.collect()

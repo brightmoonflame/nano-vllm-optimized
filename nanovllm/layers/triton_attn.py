@@ -33,6 +33,9 @@ import torch
 import triton
 import triton.language as tl
 
+# Keep the group count in one place (shared with kv_quant / model_runner).
+NUM_GROUPS = 8   # scale groups along head_dim (128 / 8 = 16 dims per group)
+
 
 _NUM_SMS = None   # cached lazily: torch.cuda.get_device_properties is too
                   # expensive to call on every decode launch (10-30% overhead).
@@ -453,6 +456,7 @@ def _paged_attn_decode_int8_kernel(
     stride_qn, stride_qh,
     stride_kb, stride_kt, stride_kh,
     stride_vb, stride_vt, stride_vh,
+    stride_ksc_b, stride_ksc_t,
     stride_vsc_b, stride_vsc_t,
     stride_on, stride_oh,
     stride_mid_sh, stride_mid_ss,
@@ -460,6 +464,8 @@ def _paged_attn_decode_int8_kernel(
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,   # HEAD_DIM // NUM_GROUPS
+    NUM_GROUPS: tl.constexpr,   # scale groups along head_dim
     BLOCK_SIZE: tl.constexpr,   # tokens per cache block (kvcache_block_size)
     BLOCK_N: tl.constexpr,      # kv tokens per iteration; must divide BLOCK_SIZE
     NUM_SPLITS: tl.constexpr,   # flash-decoding KV splits (1 = single-query path)
@@ -469,11 +475,13 @@ def _paged_attn_decode_int8_kernel(
     dequantizes in-register — no whole-cache dequant pass, no intermediate
     BF16 buffer. Used when kv_quant=True and use_triton_attn=True.
 
-    K uses a static per-head scale (shared across tokens, preserving softmax
-    consistency); V uses a per-(token, head) scale. Both float out of the dot
-    product (constant along head_dim), so we compute in int8 and post-multiply:
-        qk[t]  = k_scale[head] * softmax_scale * Σ_d q[d]·k_int8[t,d]
-        acc[d] += (p[t]·v_scale[t]) * v_int8[t,d]
+    Scales are group-wise along head_dim (NUM_GROUPS per token per head):
+    each group's scale is expanded to (BLOCK_N, HEAD_DIM) so the whole tile
+    is dequantized with a per-element scale before the dot product:
+        qk[t]  = softmax_scale * Σ_d q[d]·(k_int8[t,d]·ks[t,d//GROUP_SIZE])
+        acc[d] += Σ_t p[t]·v_int8[t,d]·vs[t,d//GROUP_SIZE]
+    Group-wise isolates outlier dims in their own group; scales are dynamic
+    (computed at store time) so no calibration and no overflow.
     """
     seq_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -500,9 +508,6 @@ def _paged_attn_decode_int8_kernel(
         n_lo = split_idx * seg_len
         n_hi = tl.minimum(n_lo + seg_len, context_len)
 
-    # K's per-head scale is a scalar shared by every token in the segment.
-    k_sc = tl.load(k_scale_ptr + kv_head_idx)
-
     for n_start in range(n_lo, n_hi, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)                       # global (mask)
         mask_n = offs_n < context_len
@@ -510,13 +515,18 @@ def _paged_attn_decode_int8_kernel(
 
         physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
 
-        # --- K: int8 dot product in fp32, then the shared per-head scale ---
+        # --- K: int8 dot in fp32 with per-group scale expanded along head_dim ---
         k_off = (physical_block.to(tl.int64) * stride_kb
                  + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
         k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
-        qk = tl.sum(q[None, :] * k_i8.to(tl.float32), axis=1)
-
-        qk = qk * k_sc * scale
+        ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
+                     + offs_in_block * stride_ksc_t + kv_head_idx * NUM_GROUPS,
+                     mask=mask_n, other=0.0)                            # (BLOCK_N, NUM_GROUPS)
+        # (BLOCK_N, G, 1) → broadcast (BLOCK_N, G, GROUP_SIZE) → (BLOCK_N, HEAD_DIM):
+        # element d uses the scale of its group d // GROUP_SIZE.
+        ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                             (BLOCK_N, HEAD_DIM))
+        qk = tl.sum(q[None, :] * k_i8.to(tl.float32) * ks_full, axis=1) * scale
         qk = tl.where(mask_n, qk, float("-inf"))
 
         # --- online softmax ---
@@ -525,17 +535,18 @@ def _paged_attn_decode_int8_kernel(
         p = tl.exp(qk - m_new)                      # (BLOCK_N,)
         alpha = tl.exp(m_i - m_new)                 # (1,)
 
-        # --- V: merge p with v_scale into one per-token weight, then int8 FMA ---
+        # --- V: same group-wise expansion; p folds into the row weight ---
         v_off = (physical_block.to(tl.int64) * stride_vb
                  + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
         v_i8 = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
-        v_sc = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
-                       + offs_in_block * stride_vsc_t + kv_head_idx,
-                       mask=mask_n, other=0.0)
-        w = p * v_sc                                # both are 0 on padding → no NaN leak
+        vs = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
+                     + offs_in_block * stride_vsc_t + kv_head_idx * NUM_GROUPS,
+                     mask=mask_n, other=0.0)
+        vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                             (BLOCK_N, HEAD_DIM))
 
         l_i = l_i * alpha + tl.sum(p[None, :], axis=1)
-        acc = acc * alpha + tl.sum(w[:, None] * v_i8.to(tl.float32), axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v_i8.to(tl.float32) * vs_full, axis=0)
         m_i = m_new
 
     if WRITE_MID:
@@ -554,8 +565,8 @@ def triton_paged_attention_int8(
     q: torch.Tensor,             # (num_seqs, num_heads, head_dim) BF16
     k_cache: torch.Tensor,       # (num_blocks, block_size, num_kv_heads, head_dim) INT8
     v_cache: torch.Tensor,       # same layout as k_cache, INT8
-    k_scale: torch.Tensor,       # (num_kv_heads,) FP32 static per-head
-    v_scale: torch.Tensor,       # (num_blocks, block_size, num_kv_heads) FP32 per-token
+    k_scale: torch.Tensor,       # (blocks, block_size, kv_heads, NUM_GROUPS) FP32
+    v_scale: torch.Tensor,       # same layout as k_scale
     block_tables: torch.Tensor,  # (num_seqs, max_num_blocks) int32
     context_lens: torch.Tensor,  # (num_seqs,) int32
     scale: float,
@@ -573,8 +584,7 @@ def triton_paged_attention_int8(
     assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
     assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
     assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1
-    assert k_scale.ndim == 1 and k_scale.numel() == num_kv_heads, "k_scale must be per-head"
-    assert v_scale.stride(-1) == 1
+    assert head_dim % NUM_GROUPS == 0
 
     BLOCK_N = 64    # divides block_size (256), so one tile never spans two cache blocks
     assert block_size % BLOCK_N == 0
@@ -590,6 +600,7 @@ def triton_paged_attention_int8(
             q.stride(0), q.stride(1),
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+            k_scale.stride(0), k_scale.stride(1),
             v_scale.stride(0), v_scale.stride(1),
             o.stride(0), o.stride(1),
             0, 0,                                         # mid strides unused
@@ -597,6 +608,8 @@ def triton_paged_attention_int8(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             HEAD_DIM=head_dim,
+            GROUP_SIZE=head_dim // NUM_GROUPS,
+            NUM_GROUPS=NUM_GROUPS,
             BLOCK_SIZE=block_size,
             BLOCK_N=BLOCK_N,
             NUM_SPLITS=1,
@@ -614,6 +627,7 @@ def triton_paged_attention_int8(
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        k_scale.stride(0), k_scale.stride(1),
         v_scale.stride(0), v_scale.stride(1),
         o.stride(0), o.stride(1),
         mid.stride(0), mid.stride(1),
@@ -621,6 +635,8 @@ def triton_paged_attention_int8(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
+        GROUP_SIZE=head_dim // NUM_GROUPS,
+        NUM_GROUPS=NUM_GROUPS,
         BLOCK_SIZE=block_size,
         BLOCK_N=BLOCK_N,
         NUM_SPLITS=num_splits,
