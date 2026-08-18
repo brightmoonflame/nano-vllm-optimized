@@ -60,17 +60,34 @@ def main():
     exact = 0
     matched = 0
     total = 0
+    first_div = []          # position of first mismatch (== len if never diverges)
     for a, b in zip(bf16, int8):
         if a == b:
             exact += 1
         matched += sum(x == y for x, y in zip(a, b))
         total += len(a)
+        d = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), len(a))
+        first_div.append(d)
+
+    # Position-wise "% matched over the whole 128-token sequence" conflates two
+    # very different things once decoding is autoregressive + greedy: (1) the
+    # per-step numerical fidelity of the INT8 kernel, and (2) the fact that a
+    # SINGLE early divergence changes the context for every following step, so
+    # the two sequences keep producing different (yet individually "valid")
+    # continuations from then on — those later positions are essentially random
+    # against each other and drag the raw rate down without indicating a bug.
+    # avg-tokens-before-first-mismatch isolates (1): it tells you how long the
+    # two paths stay identical before the first (expected, not necessarily
+    # erroneous) argmax tie-break flips.
+    avg_first_div = sum(first_div) / len(first_div)
 
     print("=" * 56)
     print(f"device: {torch.cuda.get_device_name(0)}   prompts={len(PROMPTS)}  max_tokens={args.max_tokens}")
     print("=" * 56)
-    print(f"exact-match rate:  {exact}/{len(PROMPTS)} ({100 * exact / len(PROMPTS):.1f}%)")
-    print(f"token-match rate:  {matched}/{total} ({100 * matched / total:.2f}%)")
+    print(f"exact-match rate:        {exact}/{len(PROMPTS)} ({100 * exact / len(PROMPTS):.1f}%)")
+    print(f"token-match rate:        {matched}/{total} ({100 * matched / total:.2f}%)  (raw, cascade-sensitive)")
+    print(f"avg tokens before diverge: {avg_first_div:.1f} / {args.max_tokens}  "
+          f"(per-prompt: {first_div})")
 
 
 if __name__ == "__main__":

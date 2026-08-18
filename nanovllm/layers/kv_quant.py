@@ -50,9 +50,15 @@ def store_kvcache_int8_kernel(
     k_in = tl.load(key_ptr + idx * key_stride + head * HEAD_DIM + col).to(tl.float32)
     # (HEAD_DIM,) → (NUM_GROUPS, GROUP_SIZE): per-group abs-max.
     k_g = tl.reshape(k_in, (NUM_GROUPS, GROUP_SIZE))
-    k_scale = tl.max(tl.abs(k_g), axis=1) / 127.0                    # (NUM_GROUPS,)
-    k_int8 = (k_in / tl.reshape(tl.broadcast_to(
-        k_scale[:, None], (NUM_GROUPS, GROUP_SIZE)), (HEAD_DIM,))).to(tl.int8)
+    # Clamp avoids a 0/0 -> NaN scale for an (unlikely but possible) all-zero
+    # group, which would otherwise poison the whole dot product downstream.
+    k_scale = tl.maximum(tl.max(tl.abs(k_g), axis=1) / 127.0, 1e-6)  # (NUM_GROUPS,)
+    k_div = k_in / tl.reshape(tl.broadcast_to(
+        k_scale[:, None], (NUM_GROUPS, GROUP_SIZE)), (HEAD_DIM,))
+    # `.to(tl.int8)` truncates toward zero (like a C cast), not round-to-nearest;
+    # left as-is it biases every element toward 0 by up to 1 LSB (avg 0.5 LSB).
+    # Round-half-away-from-zero here halves the average quantization error.
+    k_int8 = tl.where(k_div >= 0, k_div + 0.5, k_div - 0.5).to(tl.int8)
     tl.store(k_cache_ptr + base_off + col, k_int8)
     tl.store(k_scale_ptr + slot * NUM_KV_HEADS * NUM_GROUPS + head * NUM_GROUPS
              + tl.arange(0, NUM_GROUPS), k_scale)
@@ -60,9 +66,10 @@ def store_kvcache_int8_kernel(
     # --- Value (same recipe) ---
     v_in = tl.load(value_ptr + idx * value_stride + head * HEAD_DIM + col).to(tl.float32)
     v_g = tl.reshape(v_in, (NUM_GROUPS, GROUP_SIZE))
-    v_scale = tl.max(tl.abs(v_g), axis=1) / 127.0
-    v_int8 = (v_in / tl.reshape(tl.broadcast_to(
-        v_scale[:, None], (NUM_GROUPS, GROUP_SIZE)), (HEAD_DIM,))).to(tl.int8)
+    v_scale = tl.maximum(tl.max(tl.abs(v_g), axis=1) / 127.0, 1e-6)
+    v_div = v_in / tl.reshape(tl.broadcast_to(
+        v_scale[:, None], (NUM_GROUPS, GROUP_SIZE)), (HEAD_DIM,))
+    v_int8 = tl.where(v_div >= 0, v_div + 0.5, v_div - 0.5).to(tl.int8)
     tl.store(v_cache_ptr + base_off + col, v_int8)
     tl.store(v_scale_ptr + slot * NUM_KV_HEADS * NUM_GROUPS + head * NUM_GROUPS
              + tl.arange(0, NUM_GROUPS), v_scale)
