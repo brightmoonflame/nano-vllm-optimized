@@ -66,6 +66,7 @@ class Attention(nn.Module):
         self.sliding_window = sliding_window
         self.kv_quant = kv_quant
         self.use_triton_attn = use_triton_attn
+        self.mid_buffer = None      # shared flash-decoding buffer, assigned by ModelRunner
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
 
@@ -105,7 +106,8 @@ class Attention(nn.Module):
                     # dequantized in-register, no whole-cache BF16 buffer.
                     o = triton_paged_attention_int8(
                         q, k_cache, v_cache, self.k_scale, self.v_scale,
-                        context.block_tables, context.context_lens, self.scale)
+                        context.block_tables, context.context_lens, self.scale,
+                        mid=self.mid_buffer)
                 else:
                     # Default: whole-cache dequant + flash_attn (fallback baseline).
                     k_bf16 = dequant_kvcache(k_cache, self.k_scale)
@@ -116,7 +118,8 @@ class Attention(nn.Module):
             elif self.use_triton_attn and self.sliding_window is None:
                 # Triton paged attention (stage 2): single query over paged KV cache, BF16.
                 o = triton_paged_attention(q, k_cache, v_cache,
-                                           context.block_tables, context.context_lens, self.scale)
+                                           context.block_tables, context.context_lens, self.scale,
+                                           mid=self.mid_buffer)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,

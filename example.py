@@ -35,7 +35,7 @@ def main():
     # model + rejection sampling). Delete this line to re-enable it.
     draft_path = None
     speculative_config = {"model": draft_path, "num_spec_tokens": 5} if draft_path else None
-    llm = LLM(target_path, enforce_eager=True, tensor_parallel_size=1,
+    llm = LLM(target_path, enforce_eager=False, tensor_parallel_size=1,   # eager=False: CUDA graph on
               speculative_config=speculative_config,
               kv_quant=True,          # INT8 KV cache (fused Triton dequant on decode)
               use_triton_attn=True)   # False = fall back to flash_attn (baseline)

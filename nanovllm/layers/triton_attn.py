@@ -54,6 +54,27 @@ def _num_splits_for(num_seqs: int, num_heads: int) -> int:
     return 1 << (want - 1).bit_length()
 
 
+def mid_buffer_size(num_heads: int, head_dim: int, max_bs: int) -> int:
+    """Element count for a shared flash-decoding mid buffer that covers any
+    decode batch size: max over bs of (bs*heads) * splits(bs) * (head_dim+2),
+    counting only splits > 1 batches (single-split never touches mid).
+
+    One buffer can be shared by all attention layers — layers execute
+    sequentially within a forward, so at most one layer uses it at a time.
+    """
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    target = _NUM_SMS * 4
+    best = 0
+    for bs in range(1, max_bs + 1):
+        p = bs * num_heads
+        splits = 1 << (max(1, -(-target // p)) - 1).bit_length()
+        if splits > 1:
+            best = max(best, p * splits * (head_dim + 2))
+    return best
+
+
 @triton.jit
 def _split_reduce_kernel(
     mid_ptr, o_ptr,
@@ -321,6 +342,22 @@ def _paged_attn_decode_kernel(
                  acc.to(o_ptr.dtype.element_ty))
 
 
+def _get_mid(mid: torch.Tensor | None, num_seqs: int, num_heads: int,
+             num_splits: int, head_dim: int, device) -> torch.Tensor:
+    """View of a pre-allocated mid buffer, or a fresh one if not provided.
+
+    A pre-allocated buffer keeps the split path free of dynamic allocation —
+    required for CUDA-graph capture and saves a per-step empty() in eager.
+    narrow+view share storage (no alloc), so they are capture-safe.
+    """
+    need = num_seqs * num_heads * num_splits * (head_dim + 2)
+    if mid is None:
+        return torch.empty(num_seqs * num_heads, num_splits, head_dim + 2,
+                           dtype=torch.float32, device=device)
+    assert mid.numel() >= need, "mid buffer too small for this batch/split"
+    return mid.narrow(0, 0, need).view(num_seqs * num_heads, num_splits, head_dim + 2)
+
+
 def triton_paged_attention(
     q: torch.Tensor,             # (num_seqs, num_heads, head_dim)
     k_cache: torch.Tensor,       # (num_blocks, block_size, num_kv_heads, head_dim)
@@ -329,6 +366,7 @@ def triton_paged_attention(
     context_lens: torch.Tensor,  # (num_seqs,) int32, total tokens cached per seq
     scale: float,
     num_splits: int | None = None,   # flash-decoding splits; None = auto (by batch size)
+    mid: torch.Tensor | None = None, # pre-allocated split buffer (CUDA-graph friendly)
 ) -> torch.Tensor:
     """Single-query paged attention over the paged BF16 KV cache (decode path).
 
@@ -372,9 +410,8 @@ def triton_paged_attention(
 
     # Small batches: partition KV across splits, then reduce. Every program
     # writes its split slot unconditionally (no early return in the kernel),
-    # so uninitialized reads cannot happen and empty is safe.
-    mid = torch.empty(num_seqs * num_heads, num_splits, head_dim + 2,
-                      dtype=torch.float32, device=q.device)
+    # so an empty buffer is safe; `mid` may be a shared pre-allocated buffer.
+    mid = _get_mid(mid, num_seqs, num_heads, num_splits, head_dim, q.device)
     _paged_attn_decode_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, o, mid,
         block_tables, context_lens,
@@ -521,6 +558,7 @@ def triton_paged_attention_int8(
     context_lens: torch.Tensor,  # (num_seqs,) int32
     scale: float,
     num_splits: int | None = None,   # flash-decoding splits; None = auto (by batch size)
+    mid: torch.Tensor | None = None, # pre-allocated split buffer (CUDA-graph friendly)
 ) -> torch.Tensor:
     """Single-query paged attention over the paged INT8 KV cache (decode path).
 
@@ -566,8 +604,7 @@ def triton_paged_attention_int8(
         return o
 
     # See the BF16 wrapper: every split slot is written unconditionally.
-    mid = torch.empty(num_seqs * num_heads, num_splits, head_dim + 2,
-                      dtype=torch.float32, device=q.device)
+    mid = _get_mid(mid, num_seqs, num_heads, num_splits, head_dim, q.device)
     _paged_attn_decode_int8_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, k_scale, v_scale, o, mid,
         block_tables, context_lens,

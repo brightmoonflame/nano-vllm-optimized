@@ -282,13 +282,18 @@ Config.use_triton_attn
 
 ### 5a. CUDA Graph 兼容性修复
 
-- [ ] **5a-1** `model_runner.py:73`:把 CUDA graph 禁用条件从 `not config.kv_quant` 改为 `not config.kv_quant and not config.use_triton_attn`
-  - 即:**仅当 `kv_quant=True` 且 `use_triton_attn=False`(默认走 dequant 路径)时才禁用**;`use_triton_attn=True` 时走融合内核,无动态反量化,可正常捕获图
-  - 前提:4a-3 已完成,`use_triton_attn=True` + `kv_quant=True` 的 decode 走融合内核
-  - 默认行为不变:`use_triton_attn=False` + `kv_quant=True` 仍禁用 CUDA graph(与当前一致)
+- [x] **5a-1** `model_runner.py`:CUDA graph 禁用条件改为 `not (kv_quant and not use_triton_attn)`
+  - 仅当 `kv_quant=True` 且 `use_triton_attn=False`(默认动态 dequant 路径)时禁用;开启 Triton 融合内核无动态反量化,可捕获图
+  - 默认行为不变:两开关均默认关时,原条件语义等价
 
-- [ ] **5a-2** warmup 路径覆盖 INT8 融合内核
-  - `warmup_model()` 在 `use_triton_attn=True` 时确保捕获走 `triton_paged_attention_int8` 路径
+- [x] **5a-2** (新增,实现时发现的必要项)预分配共享 mid buffer,否则小 bs 图捕获会因 split 路径 `torch.empty` 动态分配而失败
+  - `triton_attn.py`:新增 `mid_buffer_size(heads, head_dim, max_bs)`(只需覆盖 splits>1 的 batch);wrapper 加可选 `mid` 参数,传入时 `narrow+view`(共享存储零分配,capture 安全)
+  - `attention.py`:`Attention.mid_buffer` 属性,decode Triton 分支透传
+  - `model_runner.py`:`_alloc_mid_buffer()` 在 allocate_kv_cache 后为全部 attention 层分配**一份共享** buffer(层间顺序执行,可复用;~0.5MB 级)
+  - 附带收益:消除每步 decode 的 `torch.empty`(3c-5 记录的开销源之一)
+  - warmup 路径:capture 前 warmup 走 decode Triton 分支 + 预分配 buffer,天然覆盖 `triton_paged_attention_int8`
+
+- [ ] **5a-3** 验证(需 CUDA 环境):`kv_quant=True + use_triton_attn=True + enforce_eager=False` 下 `example.py` capture 成功且输出正确
 
 ### 5b. 最终回归与简历数据采集
 

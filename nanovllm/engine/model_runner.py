@@ -16,6 +16,7 @@ from nanovllm.models.qwen2 import Qwen2ForCausalLM
 from nanovllm.models.llama import LlamaForCausalLM
 from nanovllm.models.gemma3 import Gemma3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.triton_attn import mid_buffer_size
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.spec_decode.metadata import make_spec_decode_metadata
@@ -74,8 +75,12 @@ class ModelRunner:
             )
             self.rejection_sampler = RejectionSampler(self.sampler)
         self.allocate_kv_cache()
-        # KV quant uses dynamic dequant at decode time — incompatible with CUDA graph.
-        if not self.enforce_eager and not config.kv_quant:
+        # KV quant's default path uses dynamic whole-cache dequant at decode
+        # time — incompatible with CUDA graph. With the fused Triton INT8
+        # kernel there is no dynamic op, so graphs are safe to capture.
+        if config.use_triton_attn:
+            self._alloc_mid_buffer()
+        if not self.enforce_eager and not (config.kv_quant and not config.use_triton_attn):
             self.capture_cudagraph()
             # Prefill graphs never pass aux_layer_ids, so they can't produce the
             # aux hidden states extend() needs — keep prompt prefill on the eager
@@ -222,6 +227,20 @@ class ModelRunner:
         per_block_mb = kv_mb / config.num_kvcache_blocks
         dtype_str = 'INT8' if config.kv_quant else 'BF16'
         print(f"KV cache: {config.num_kvcache_blocks} blocks × {per_block_mb:.1f} MB/block = {kv_mb:.1f} MB ({dtype_str})")
+
+    def _alloc_mid_buffer(self):
+        """Pre-allocate one shared flash-decoding mid buffer for all target
+        attention layers. Layers execute sequentially within a forward, so a
+        single buffer sized for the largest (batch, splits) combination
+        suffices. This removes per-step torch.empty in the split path and
+        keeps those kernels CUDA-graph capturable."""
+        mods = [m for m in self.model.modules() if getattr(m, "use_triton_attn", False)]
+        max_bs = min(self.config.max_num_seqs, 512)
+        need = max((mid_buffer_size(m.num_heads, m.head_dim, max_bs) for m in mods), default=0)
+        if need:
+            buf = torch.empty(need, dtype=torch.float32, device="cuda")
+            for m in mods:
+                m.mid_buffer = buf
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
