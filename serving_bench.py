@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of prefill tokens per chunk when chunked prefill is enabled.")
     parser.add_argument("--kv-quant", action="store_true",
                         help="Enable INT8 KV cache quantization (~48%% memory reduction).")
+    parser.add_argument("--use-triton-attn", action="store_true",
+                        help="Use the self-researched Triton attention kernels instead of the flash_attn package.")
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-json", type=Path, help="Optional path for aggregate and per-request results.")
@@ -251,6 +253,7 @@ def main() -> None:
         enable_chunked_prefill=args.enable_chunked_prefill,
         prefill_chunk_size=args.prefill_chunk_size,
         kv_quant=args.kv_quant,
+        use_triton_attn=args.use_triton_attn,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -297,6 +300,9 @@ def main() -> None:
         "cuda": torch.version.cuda,
         "flash_attn": __import__("flash_attn").__version__,
         "effective_max_model_len": effective_max_model_len,
+        "kv_quant": args.kv_quant,
+        "use_triton_attn": args.use_triton_attn,
+        "enforce_eager": args.enforce_eager,
     }
     metrics: dict[int, RequestMetrics] = {}
     requests_sent = 0
