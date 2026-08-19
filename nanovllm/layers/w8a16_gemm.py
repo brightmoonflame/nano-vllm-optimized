@@ -13,6 +13,7 @@ This avoids allocating a dequantized BF16 weight tensor during inference.
 """
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -38,19 +39,9 @@ def w8a16_linear_reference(
     scale: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP32 reference for the same fused operation as the Triton kernel.
-
-    Do not materialize ``qweight * scale`` in BF16/FP16 here: that introduces
-    one extra rounding step per weight and is therefore not numerically the
-    same operation as applying the FP32 scale after the dot product.
-    """
-    input_shape = x.shape
-    x_2d = x.reshape(-1, input_shape[-1])
-    out = x_2d.float() @ qweight.float()
-    out.mul_(scale.float())
-    if bias is not None:
-        out.add_(bias.float())
-    return out.to(dtype=x.dtype).reshape(*input_shape[:-1], qweight.shape[1])
+    """Reference path used by tests; deliberately materializes BF16/FP16 W."""
+    weight = (qweight.t().float() * scale.float()[:, None]).to(dtype=x.dtype)
+    return F.linear(x, weight, bias)
 
 
 @triton.jit
