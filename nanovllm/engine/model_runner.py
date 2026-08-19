@@ -16,7 +16,6 @@ from nanovllm.models.qwen2 import Qwen2ForCausalLM
 from nanovllm.models.llama import LlamaForCausalLM
 from nanovllm.models.gemma3 import Gemma3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.layers.linear import enable_w8a16
 from nanovllm.layers.triton_attn import mid_buffer_size
 from nanovllm.layers.kv_quant import NUM_GROUPS
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -53,10 +52,6 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         self.model = model_dict[hf_config.model_type](hf_config)
-        if config.weight_quant == "int8_w8a16":
-            # Must precede load_model(): every Linear loader quantizes its
-            # local TP shard immediately instead of retaining a BF16 copy.
-            enable_w8a16(self.model)
         load_model(self.model, config.model)
         # Must happen before warmup_model(): warmup runs a real prefill forward,
         # so the switch needs to be in place for it to exercise the Triton path.
@@ -86,13 +81,7 @@ class ModelRunner:
         # kernel there is no dynamic op, so graphs are safe to capture.
         if config.use_triton_attn:
             self._alloc_mid_buffer()
-        # W8A16 deliberately starts eager-only. Triton compilation has to be
-        # pre-warmed for every Linear shape before graph capture; preserving a
-        # safe eager fallback is preferable to silently failing capture.
-        if not self.enforce_eager and not (
-            (config.kv_quant and not config.use_triton_attn)
-            or config.weight_quant is not None
-        ):
+        if not self.enforce_eager and not (config.kv_quant and not config.use_triton_attn):
             self.capture_cudagraph()
             # Prefill graphs never pass aux_layer_ids, so they can't produce the
             # aux hidden states extend() needs — keep prompt prefill on the eager
@@ -506,12 +495,7 @@ class ModelRunner:
                 return self.run_prefill_cudagraph(input_ids, positions)
             return self.model.compute_logits(self._target_forward(input_ids, positions))
 
-        if (
-            self.enforce_eager
-            or input_ids.size(0) > 512
-            or self.config.kv_quant
-            or self.config.weight_quant is not None
-        ):
+        if self.enforce_eager or input_ids.size(0) > 512 or self.config.kv_quant:
             return self.model.compute_logits(self.model(input_ids, positions))
 
         bs = input_ids.size(0)
