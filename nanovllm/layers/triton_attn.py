@@ -126,28 +126,53 @@ def _split_reduce_kernel(
 @triton.jit
 def _fwd_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr,
-    cu_seqlens_ptr,
+    cu_seqlens_q_ptr, cu_seqlens_k_ptr,
+    block_tables_ptr,
+    k_scale_ptr, v_scale_ptr,
     stride_qn, stride_qh,
-    stride_kn, stride_kh,
-    stride_vn, stride_vh,
+    stride_kt, stride_kh, stride_kb,
+    stride_vt, stride_vh, stride_vb,
+    stride_ksc_b, stride_ksc_t,
+    stride_vsc_b, stride_vsc_t,
     stride_on, stride_oh,
+    stride_bt,
     scale,
+    IS_PAGED: tl.constexpr,
+    IS_INT8: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
+    """Unified FlashAttention-2 forward (prefill) with two compile-time switches:
+
+      IS_PAGED  False: dense varlen K/V (stride_kt is the token stride);
+                True:  paged K/V via block_tables (stride_kb/stride_kt).
+      IS_INT8   False: K/V are BF16; True: INT8 + group-wise scale, dequantized
+                in-register back to the query dtype before the dot products.
+
+    Dense is IS_PAGED=False with cu_seqlens_k == cu_seqlens_q, so seqlen_k ==
+    seqlen_q and start == 0 — the offset causal reduces to standard causal. The
+    INT8 variant is only ever used paged (dense prefill consumes fresh BF16 K/V).
+    """
     m_block = tl.program_id(0)
     head_idx = tl.program_id(1)
     seq_idx = tl.program_id(2)
 
-    seq_start = tl.load(cu_seqlens_ptr + seq_idx)
-    seq_end = tl.load(cu_seqlens_ptr + seq_idx + 1)
-    seqlen = seq_end - seq_start
+    seq_start_q = tl.load(cu_seqlens_q_ptr + seq_idx)
+    seq_end_q = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
+    seq_start_k = tl.load(cu_seqlens_k_ptr + seq_idx)
+    seq_end_k = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
+    seqlen_q = seq_end_q - seq_start_q
+    seqlen_k = seq_end_k - seq_start_k
+    start = seqlen_k - seqlen_q   # cached prefix length (0 for dense)
 
     m_start = m_block * BLOCK_M
-    if m_start >= seqlen:
+    if m_start >= seqlen_q:
         return    # this query block lies entirely past this sequence's end
 
     # GQA: each group of (num_heads // num_kv_heads) query heads shares one KV head.
@@ -155,9 +180,9 @@ def _fwd_kernel(
 
     offs_m = m_start + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
-    mask_m = offs_m < seqlen
+    mask_m = offs_m < seqlen_q
 
-    q_ptrs = q_ptr + (seq_start + offs_m)[:, None] * stride_qn + head_idx * stride_qh + offs_d[None, :]
+    q_ptrs = q_ptr + (seq_start_q + offs_m)[:, None] * stride_qn + head_idx * stride_qh + offs_d[None, :]
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
     # Running online-softmax state: row-wise max, row-wise sumexp, weighted accumulator.
@@ -165,17 +190,40 @@ def _fwd_kernel(
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
 
-    # Causal: query block [m_start, m_start+BLOCK_M) only needs keys up to its own last row.
-    n_end = m_start + BLOCK_M
+    # Offset causal: query row at global position (start + offs_m) attends keys
+    # [0, start + offs_m]; the exclusive loop bound is clamped to the key length.
+    n_end = tl.minimum(start + m_start + BLOCK_M, seqlen_k)
     for n_start in range(0, n_end, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < seqlen
+        offs_n = n_start + tl.arange(0, BLOCK_N)                     # seq-local key positions
+        mask_n = offs_n < seqlen_k
 
-        k_ptrs = k_ptr + (seq_start + offs_n)[:, None] * stride_kn + kv_head_idx * stride_kh + offs_d[None, :]
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+        if IS_PAGED:
+            offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)
+            physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
+            k_off = (physical_block.to(tl.int64) * stride_kb
+                     + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
+            v_off = (physical_block.to(tl.int64) * stride_vb
+                     + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
+        else:
+            k_off = (seq_start_k + offs_n)[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :]
+            v_off = (seq_start_k + offs_n)[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :]
+
+        if IS_INT8:
+            # INT8 -> group-scale dequant -> query dtype, then standard dot. Uses
+            # physical_block/offs_in_block from the IS_PAGED branch (INT8 is paged-only).
+            offs_g = tl.arange(0, NUM_GROUPS)
+            k_i8 = tl.load(k_ptr + k_off, mask=mask_n[:, None], other=0.0)
+            ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
+                         + offs_in_block[:, None] * stride_ksc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                         mask=mask_n[:, None], other=0.0)
+            ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                                 (BLOCK_N, HEAD_DIM))
+            k = (k_i8.to(tl.float32) * ks_full).to(q_ptr.dtype.element_ty)
+        else:
+            k = tl.load(k_ptr + k_off, mask=mask_n[:, None], other=0.0)
 
         qk = tl.dot(q, tl.trans(k)) * scale
-        causal_mask = offs_m[:, None] >= offs_n[None, :]
+        causal_mask = (start + offs_m)[:, None] >= offs_n[None, :]
         qk = tl.where(causal_mask & mask_n[None, :], qk, float("-inf"))
 
         # Rescale the running state to the new (larger) row max, then fold in this block.
@@ -187,14 +235,22 @@ def _fwd_kernel(
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
-        v_ptrs = v_ptr + (seq_start + offs_n)[:, None] * stride_vn + kv_head_idx * stride_vh + offs_d[None, :]
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        acc += tl.dot(p.to(v.dtype), v)
+        if IS_INT8:
+            v_i8 = tl.load(v_ptr + v_off, mask=mask_n[:, None], other=0.0)
+            vs = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
+                         + offs_in_block[:, None] * stride_vsc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                         mask=mask_n[:, None], other=0.0)
+            vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                                 (BLOCK_N, HEAD_DIM))
+            v = (v_i8.to(tl.float32) * vs_full).to(q_ptr.dtype.element_ty)
+        else:
+            v = tl.load(v_ptr + v_off, mask=mask_n[:, None], other=0.0)
 
+        acc += tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
     acc = acc / l_i[:, None]
-    o_ptrs = o_ptr + (seq_start + offs_m)[:, None] * stride_on + head_idx * stride_oh + offs_d[None, :]
+    o_ptrs = o_ptr + (seq_start_q + offs_m)[:, None] * stride_on + head_idx * stride_oh + offs_d[None, :]
     tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=mask_m[:, None])
 
 
@@ -229,109 +285,32 @@ def triton_flash_attn_varlen(
     BLOCK_N = 64
     grid = (triton.cdiv(max_seqlen, BLOCK_M), num_heads, num_seqs)
 
+    # Dense path: cu_seqlens_k == cu_seqlens_q; paged-only params are dummies
+    # (never dereferenced when IS_PAGED=False / IS_INT8=False).
     _fwd_kernel[grid](
         q, k, v, o,
-        cu_seqlens,
+        cu_seqlens, cu_seqlens,
+        k, k, k,                       # block_tables / k_scale / v_scale (dummy)
         q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1),
-        v.stride(0), v.stride(1),
+        k.stride(0), k.stride(1), 0,   # stride_kt, stride_kh, stride_kb
+        v.stride(0), v.stride(1), 0,
+        0, 0, 0, 0,                    # scale strides (dummy)
         o.stride(0), o.stride(1),
+        0,                             # stride_bt (dummy)
         scale,
+        IS_PAGED=False,
+        IS_INT8=False,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
+        GROUP_SIZE=head_dim // NUM_GROUPS,
+        NUM_GROUPS=NUM_GROUPS,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        BLOCK_SIZE=1,                  # unused when IS_PAGED=False
         num_warps=8,
     )
     return o
-
-
-@triton.jit
-def _fwd_kernel_paged(
-    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
-    cu_seqlens_q_ptr, cu_seqlens_k_ptr,
-    block_tables_ptr,
-    stride_qn, stride_qh,
-    stride_kb, stride_kt, stride_kh,
-    stride_vb, stride_vt, stride_vh,
-    stride_on, stride_oh,
-    stride_bt,
-    scale,
-    num_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """FA2 forward for prefix-cache prefill: queries are the newly-scheduled
-    tokens, keys/values live in the paged cache (prefix + new tokens)."""
-    m_block = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    seq_idx = tl.program_id(2)
-
-    seq_start_q = tl.load(cu_seqlens_q_ptr + seq_idx)
-    seq_end_q = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
-    seq_start_k = tl.load(cu_seqlens_k_ptr + seq_idx)
-    seq_end_k = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
-    seqlen_q = seq_end_q - seq_start_q
-    seqlen_k = seq_end_k - seq_start_k
-    start = seqlen_k - seqlen_q   # cached prefix length (num_cached_tokens)
-
-    m_start = m_block * BLOCK_M
-    if m_start >= seqlen_q:
-        return
-
-    kv_head_idx = head_idx // (num_heads // num_kv_heads)
-
-    offs_m = m_start + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, HEAD_DIM)
-    mask_m = offs_m < seqlen_q
-
-    q_ptrs = q_ptr + (seq_start_q + offs_m)[:, None] * stride_qn + head_idx * stride_qh + offs_d[None, :]
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-
-    m_i = tl.full((BLOCK_M,), value=float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
-
-    # Offset causal: query row at global position (start + offs_m) attends keys
-    # [0, start + offs_m]. The last row needs keys up to start + m_start + BLOCK_M - 1,
-    # so the exclusive loop bound is +1, clamped to the actual key length.
-    n_end = tl.minimum(start + m_start + BLOCK_M, seqlen_k)
-    for n_start in range(0, n_end, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)                     # global key positions
-        mask_n = offs_n < seqlen_k
-        offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)  # within-block (addressing)
-        physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
-
-        k_off = (physical_block.to(tl.int64) * stride_kb
-                 + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
-        k = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
-
-        qk = tl.dot(q, tl.trans(k)) * scale
-        causal_mask = (start + offs_m)[:, None] >= offs_n[None, :]
-        qk = tl.where(causal_mask & mask_n[None, :], qk, float("-inf"))
-
-        m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        p = tl.exp(qk - m_new[:, None])
-        alpha = tl.exp(m_i - m_new)
-
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None]
-
-        v_off = (physical_block.to(tl.int64) * stride_vb
-                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
-        v = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
-        acc += tl.dot(p.to(v.dtype), v)
-
-        m_i = m_new
-
-    acc = acc / l_i[:, None]
-    o_ptrs = o_ptr + (seq_start_q + offs_m)[:, None] * stride_on + head_idx * stride_oh + offs_d[None, :]
-    tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=mask_m[:, None])
 
 
 def triton_flash_attn_varlen_paged(
@@ -373,138 +352,31 @@ def triton_flash_attn_varlen_paged(
     BLOCK_N = 64
     grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
 
-    _fwd_kernel_paged[grid](
+    _fwd_kernel[grid](
         q, k_cache, v_cache, o,
         cu_seqlens_q, cu_seqlens_k,
         block_tables,
+        k_cache, k_cache,              # k_scale / v_scale (dummy, IS_INT8=False)
         q.stride(0), q.stride(1),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        k_cache.stride(1), k_cache.stride(2), k_cache.stride(0),   # stride_kt, stride_kh, stride_kb
+        v_cache.stride(1), v_cache.stride(2), v_cache.stride(0),
+        0, 0, 0, 0,                    # scale strides (dummy)
         o.stride(0), o.stride(1),
         block_tables.stride(0),
         scale,
+        IS_PAGED=True,
+        IS_INT8=False,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
+        GROUP_SIZE=head_dim // NUM_GROUPS,
+        NUM_GROUPS=NUM_GROUPS,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_SIZE=block_size,
         num_warps=8,
     )
     return o
-
-
-@triton.jit
-def _fwd_kernel_paged_int8(
-    q_ptr, k_cache_ptr, v_cache_ptr, k_scale_ptr, v_scale_ptr, o_ptr,
-    cu_seqlens_q_ptr, cu_seqlens_k_ptr,
-    block_tables_ptr,
-    stride_qn, stride_qh,
-    stride_kb, stride_kt, stride_kh,
-    stride_vb, stride_vt, stride_vh,
-    stride_ksc_b, stride_ksc_t,
-    stride_vsc_b, stride_vsc_t,
-    stride_on, stride_oh,
-    stride_bt,
-    scale,
-    num_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """FA2 prefill for the INT8 prefix-cache case.
-
-    Same structure as `_fwd_kernel_paged` (queries = newly-scheduled tokens,
-    keys/values read from the paged cache with offset causal), except K/V are
-    INT8 and dequantized in-register (int8 × group scale) back to the query
-    dtype before the dot products. Unlike the decode kernel — which uses an
-    fp32 element-wise sum because it has a single query (BLOCK_M=1) — prefill
-    has BLOCK_M=128 queries, so an fp32 (BLOCK_M, BLOCK_N, HEAD_DIM) product
-    would explode registers; dequantizing to bf16 and using tl.dot keeps it
-    tiled. This matches the reference `dequant_kvcache` (which also dequantizes
-    to bf16), so precision is identical up to the same bf16 rounding.
-    """
-    m_block = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    seq_idx = tl.program_id(2)
-
-    seq_start_q = tl.load(cu_seqlens_q_ptr + seq_idx)
-    seq_end_q = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
-    seq_start_k = tl.load(cu_seqlens_k_ptr + seq_idx)
-    seq_end_k = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
-    seqlen_q = seq_end_q - seq_start_q
-    seqlen_k = seq_end_k - seq_start_k
-    start = seqlen_k - seqlen_q   # cached prefix length
-
-    m_start = m_block * BLOCK_M
-    if m_start >= seqlen_q:
-        return
-
-    kv_head_idx = head_idx // (num_heads // num_kv_heads)
-
-    offs_m = m_start + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, HEAD_DIM)
-    offs_g = tl.arange(0, NUM_GROUPS)
-    mask_m = offs_m < seqlen_q
-
-    q_ptrs = q_ptr + (seq_start_q + offs_m)[:, None] * stride_qn + head_idx * stride_qh + offs_d[None, :]
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-
-    m_i = tl.full((BLOCK_M,), value=float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
-
-    n_end = tl.minimum(start + m_start + BLOCK_M, seqlen_k)
-    for n_start in range(0, n_end, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)                     # global positions (mask)
-        mask_n = offs_n < seqlen_k
-        offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)  # within-block (addressing)
-        physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
-
-        # --- K: int8 -> group-scale dequant -> query dtype, then standard dot ---
-        k_off = (physical_block.to(tl.int64) * stride_kb
-                 + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
-        k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
-        ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
-                     + offs_in_block[:, None] * stride_ksc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
-                     mask=mask_n[:, None], other=0.0)                  # (BLOCK_N, NUM_GROUPS)
-        ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
-                             (BLOCK_N, HEAD_DIM))
-        k = (k_i8.to(tl.float32) * ks_full).to(q_ptr.dtype.element_ty)
-
-        qk = tl.dot(q, tl.trans(k)) * scale
-        causal_mask = (start + offs_m)[:, None] >= offs_n[None, :]
-        qk = tl.where(causal_mask & mask_n[None, :], qk, float("-inf"))
-
-        m_ij = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
-        p = tl.exp(qk - m_new[:, None])
-        alpha = tl.exp(m_i - m_new)
-
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None]
-
-        # --- V: same group-wise dequant ---
-        v_off = (physical_block.to(tl.int64) * stride_vb
-                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
-        v_i8 = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
-        vs = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
-                     + offs_in_block[:, None] * stride_vsc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
-                     mask=mask_n[:, None], other=0.0)
-        vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
-                             (BLOCK_N, HEAD_DIM))
-        v = (v_i8.to(tl.float32) * vs_full).to(q_ptr.dtype.element_ty)
-
-        acc += tl.dot(p.to(v.dtype), v)
-        m_i = m_new
-
-    acc = acc / l_i[:, None]
-    o_ptrs = o_ptr + (seq_start_q + offs_m)[:, None] * stride_on + head_idx * stride_oh + offs_d[None, :]
-    tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=mask_m[:, None])
 
 
 def triton_flash_attn_varlen_paged_int8(
@@ -539,18 +411,21 @@ def triton_flash_attn_varlen_paged_int8(
     BLOCK_N = 64
     grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
 
-    _fwd_kernel_paged_int8[grid](
-        q, k_cache, v_cache, k_scale, v_scale, o,
+    _fwd_kernel[grid](
+        q, k_cache, v_cache, o,
         cu_seqlens_q, cu_seqlens_k,
         block_tables,
+        k_scale, v_scale,
         q.stride(0), q.stride(1),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        k_scale.stride(0), k_scale.stride(1),
+        k_cache.stride(1), k_cache.stride(2), k_cache.stride(0),   # stride_kt, stride_kh, stride_kb
+        v_cache.stride(1), v_cache.stride(2), v_cache.stride(0),
+        k_scale.stride(0), k_scale.stride(1),                      # stride_ksc_b, stride_ksc_t
         v_scale.stride(0), v_scale.stride(1),
         o.stride(0), o.stride(1),
         block_tables.stride(0),
         scale,
+        IS_PAGED=True,
+        IS_INT8=True,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
