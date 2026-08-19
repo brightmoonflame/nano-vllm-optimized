@@ -228,7 +228,7 @@ llm = LLM(
 )
 ```
 
-The first path quantizes Transformer QKV/O/MLP Linear layers with symmetric per-output-channel scales, while embeddings, norms, and LM head remain BF16. `weight_quant=None` (the default) keeps the original path. Run `python bench_w8a16.py --model /root/model/Llama-3.2-3B-Instruct` for isolated BF16-vs-W8A16 weight-memory and end-to-end throughput numbers; run `python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct` for free-running greedy accuracy; and run `python bench_teacher_forced.py --model /root/model/Llama-3.2-3B-Instruct --quantization int8_w8a16` for cascade-free teacher-forced PPL, top-1 agreement, and BF16-top-k logits MAE/RMSE. W8A16 initially uses the eager path while CUDA-Graph pre-warming for all Linear shapes is kept as a follow-up.
+The first path quantizes Transformer QKV/O/MLP Linear layers with symmetric per-output-channel scales, while embeddings, norms, and LM head remain BF16. `weight_quant=None` (the default) keeps the original path. Run `python bench_w8a16.py --model /root/model/Llama-3.2-3B-Instruct` for isolated BF16-vs-W8A16 weight-memory and end-to-end throughput numbers; run `python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct` for greedy accuracy. W8A16 initially uses the eager path while CUDA-Graph pre-warming for all Linear shapes is kept as a follow-up.
 
 #### CUDA Graph (`serving_bench.py` + `bench_prefill_graph.py`)
 
