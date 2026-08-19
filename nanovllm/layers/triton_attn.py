@@ -441,27 +441,39 @@ def triton_flash_attn_varlen_paged_int8(
 
 @triton.jit
 def _paged_attn_decode_kernel(
-    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, mid_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, k_scale_ptr, v_scale_ptr, o_ptr, mid_ptr,
     block_tables_ptr, context_lens_ptr,
     scale,
     stride_qn, stride_qh,
     stride_kb, stride_kt, stride_kh,
     stride_vb, stride_vt, stride_vh,
+    stride_ksc_b, stride_ksc_t,
+    stride_vsc_b, stride_vsc_t,
     stride_on, stride_oh,
     stride_mid_sh, stride_mid_ss,
     stride_bt,
+    IS_INT8: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,   # HEAD_DIM // NUM_GROUPS
+    NUM_GROUPS: tl.constexpr,   # scale groups along head_dim
     BLOCK_SIZE: tl.constexpr,   # tokens per cache block (kvcache_block_size)
     BLOCK_N: tl.constexpr,      # kv tokens per iteration; must divide BLOCK_SIZE
     NUM_SPLITS: tl.constexpr,   # flash-decoding KV splits (1 = single-query path)
     WRITE_MID: tl.constexpr,    # True: write (m,l,acc) to mid (multi-split);
                                 # False: write final output directly (single split)
 ):
-    # One program per (sequence, query head, KV split): decode has a single
-    # query token, so softmax state is scalar and the accumulator is a
-    # HEAD_DIM vector.
+    """Single-query paged attention over the paged KV cache (decode path).
+
+    One compile-time switch:
+      IS_INT8  False: K/V are BF16; True: INT8 + group-wise scale, dequantized
+               in-register (element-wise fp32 sum, since BLOCK_M == 1).
+
+    One program per (sequence, query head, KV split): decode has a single
+    query token, so softmax state is scalar and the accumulator is a
+    HEAD_DIM vector.
+    """
     seq_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     split_idx = tl.program_id(2)
@@ -470,6 +482,7 @@ def _paged_attn_decode_kernel(
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
 
     offs_d = tl.arange(0, HEAD_DIM)
+    offs_g = tl.arange(0, NUM_GROUPS)   # used only by the IS_INT8 branch
     q = tl.load(q_ptr + seq_idx * stride_qn + head_idx * stride_qh + offs_d)
 
     # Running online-softmax state. Kept as shape-(1,) tensors on purpose:
@@ -511,9 +524,23 @@ def _paged_attn_decode_kernel(
 
         k_off = (physical_block.to(tl.int64) * stride_kb
                  + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
-        k = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
+        v_off = (physical_block.to(tl.int64) * stride_vb
+                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
 
-        qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1) * scale
+        if IS_INT8:
+            # INT8 -> group-scale dequant -> fp32, then element-wise q·k (the
+            # single-query path sums over head_dim directly; no tl.dot).
+            k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
+            ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
+                         + offs_in_block[:, None] * stride_ksc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                         mask=mask_n[:, None], other=0.0)               # (BLOCK_N, NUM_GROUPS)
+            ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                                 (BLOCK_N, HEAD_DIM))
+            qk = tl.sum(q[None, :].to(tl.float32) * k_i8.to(tl.float32) * ks_full, axis=1) * scale
+        else:
+            k = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
+            qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1) * scale
+
         qk = tl.where(mask_n, qk, float("-inf"))
 
         m_ij = tl.max(qk[None, :], axis=1)          # (1,)
@@ -521,12 +548,19 @@ def _paged_attn_decode_kernel(
         p = tl.exp(qk - m_new)                      # (BLOCK_N,) - (1,) -> (BLOCK_N,)
         alpha = tl.exp(m_i - m_new)                 # (1,)
 
-        v_off = (physical_block.to(tl.int64) * stride_vb
-                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
-        v = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
+        if IS_INT8:
+            v_i8 = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
+            vs = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
+                         + offs_in_block[:, None] * stride_vsc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                         mask=mask_n[:, None], other=0.0)
+            vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                                 (BLOCK_N, HEAD_DIM))
+            acc = acc * alpha + tl.sum(p[:, None] * v_i8.to(tl.float32) * vs_full, axis=0)
+        else:
+            v = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
+            acc = acc * alpha + tl.sum(p[:, None] * v.to(tl.float32), axis=0)
 
         l_i = l_i * alpha + tl.sum(p[None, :], axis=1)          # (1,)
-        acc = acc * alpha + tl.sum(p[:, None] * v.to(tl.float32), axis=0)
         m_i = m_new
 
     if WRITE_MID:
@@ -589,18 +623,22 @@ def triton_paged_attention(
     if num_splits == 1:
         # Large batches already saturate the GPU: single-pass, direct output.
         _paged_attn_decode_kernel[(num_seqs, num_heads, 1)](
-            q, k_cache, v_cache, o, o,        # mid_ptr unused (WRITE_MID=False)
+            q, k_cache, v_cache, k_cache, k_cache, o, o,   # scale ptrs & mid unused (IS_INT8=False, WRITE_MID=False)
             block_tables, context_lens,
             scale,
             q.stride(0), q.stride(1),
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+            0, 0, 0, 0,                                     # scale strides unused
             o.stride(0), o.stride(1),
-            0, 0,                             # mid strides unused
+            0, 0,                                           # mid strides unused
             block_tables.stride(0),
+            IS_INT8=False,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             HEAD_DIM=head_dim,
+            GROUP_SIZE=head_dim // NUM_GROUPS,
+            NUM_GROUPS=NUM_GROUPS,
             BLOCK_SIZE=block_size,
             BLOCK_N=BLOCK_N,
             NUM_SPLITS=1,
@@ -614,18 +652,22 @@ def triton_paged_attention(
     # so an empty buffer is safe; `mid` may be a shared pre-allocated buffer.
     mid = _get_mid(mid, num_seqs, num_heads, num_splits, head_dim, q.device)
     _paged_attn_decode_kernel[(num_seqs, num_heads, num_splits)](
-        q, k_cache, v_cache, o, mid,
+        q, k_cache, v_cache, k_cache, k_cache, o, mid,
         block_tables, context_lens,
         scale,
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        0, 0, 0, 0,                                     # scale strides unused
         o.stride(0), o.stride(1),
         mid.stride(0), mid.stride(1),
         block_tables.stride(0),
+        IS_INT8=False,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
+        GROUP_SIZE=head_dim // NUM_GROUPS,
+        NUM_GROUPS=NUM_GROUPS,
         BLOCK_SIZE=block_size,
         BLOCK_N=BLOCK_N,
         NUM_SPLITS=num_splits,
@@ -641,120 +683,6 @@ def triton_paged_attention(
         HEAD_DIM=head_dim,
     )
     return o
-
-
-@triton.jit
-def _paged_attn_decode_int8_kernel(
-    q_ptr, k_cache_ptr, v_cache_ptr, k_scale_ptr, v_scale_ptr, o_ptr, mid_ptr,
-    block_tables_ptr, context_lens_ptr,
-    scale,
-    stride_qn, stride_qh,
-    stride_kb, stride_kt, stride_kh,
-    stride_vb, stride_vt, stride_vh,
-    stride_ksc_b, stride_ksc_t,
-    stride_vsc_b, stride_vsc_t,
-    stride_on, stride_oh,
-    stride_mid_sh, stride_mid_ss,
-    stride_bt,
-    num_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,   # HEAD_DIM // NUM_GROUPS
-    NUM_GROUPS: tl.constexpr,   # scale groups along head_dim
-    BLOCK_SIZE: tl.constexpr,   # tokens per cache block (kvcache_block_size)
-    BLOCK_N: tl.constexpr,      # kv tokens per iteration; must divide BLOCK_SIZE
-    NUM_SPLITS: tl.constexpr,   # flash-decoding KV splits (1 = single-query path)
-    WRITE_MID: tl.constexpr,    # True: write (m,l,acc) to mid; False: direct output
-):
-    """Fused INT8 decode attention: reads the INT8 paged cache directly and
-    dequantizes in-register — no whole-cache dequant pass, no intermediate
-    BF16 buffer. Used when kv_quant=True and use_triton_attn=True.
-
-    Scales are group-wise along head_dim (NUM_GROUPS per token per head):
-    each group's scale is expanded to (BLOCK_N, HEAD_DIM) so the whole tile
-    is dequantized with a per-element scale before the dot product:
-        qk[t]  = softmax_scale * Σ_d q[d]·(k_int8[t,d]·ks[t,d//GROUP_SIZE])
-        acc[d] += Σ_t p[t]·v_int8[t,d]·vs[t,d//GROUP_SIZE]
-    Group-wise isolates outlier dims in their own group; scales are dynamic
-    (computed at store time) so no calibration and no overflow.
-    """
-    seq_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    split_idx = tl.program_id(2)
-
-    context_len = tl.load(context_lens_ptr + seq_idx)
-    kv_head_idx = head_idx // (num_heads // num_kv_heads)
-
-    offs_d = tl.arange(0, HEAD_DIM)
-    q = tl.load(q_ptr + seq_idx * stride_qn + head_idx * stride_qh + offs_d).to(tl.float32)
-
-    # Running online-softmax state (shape (1,) — see BF16 kernel note).
-    m_i = tl.full((1,), float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros((1,), dtype=tl.float32)
-    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
-
-    # Flash-decoding segment partition (see BF16 kernel note). The constexpr
-    # single-split branch keeps the original constant loop lower bound.
-    if NUM_SPLITS == 1:
-        n_lo = 0
-        n_hi = context_len
-    else:
-        seg_len = tl.cdiv(tl.cdiv(context_len, BLOCK_N), NUM_SPLITS) * BLOCK_N
-        n_lo = split_idx * seg_len
-        n_hi = tl.minimum(n_lo + seg_len, context_len)
-
-    offs_g = tl.arange(0, NUM_GROUPS)
-    for n_start in range(n_lo, n_hi, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)                       # global (mask)
-        mask_n = offs_n < context_len
-        offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)   # within-block (addressing)
-
-        physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
-
-        # --- K: int8 dot in fp32 with per-group scale expanded along head_dim ---
-        k_off = (physical_block.to(tl.int64) * stride_kb
-                 + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
-        k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
-        ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
-                     + offs_in_block[:, None] * stride_ksc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
-                     mask=mask_n[:, None], other=0.0)                   # (BLOCK_N, NUM_GROUPS)
-        # (BLOCK_N, G, 1) → broadcast (BLOCK_N, G, GROUP_SIZE) → (BLOCK_N, HEAD_DIM):
-        # element d uses the scale of its group d // GROUP_SIZE.
-        ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
-                             (BLOCK_N, HEAD_DIM))
-        qk = tl.sum(q[None, :] * k_i8.to(tl.float32) * ks_full, axis=1) * scale
-        qk = tl.where(mask_n, qk, float("-inf"))
-
-        # --- online softmax ---
-        m_ij = tl.max(qk[None, :], axis=1)          # (1,)
-        m_new = tl.maximum(m_i, m_ij)               # (1,)
-        p = tl.exp(qk - m_new)                      # (BLOCK_N,)
-        alpha = tl.exp(m_i - m_new)                 # (1,)
-
-        # --- V: same group-wise expansion; p folds into the row weight ---
-        v_off = (physical_block.to(tl.int64) * stride_vb
-                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
-        v_i8 = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
-        vs = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
-                     + offs_in_block[:, None] * stride_vsc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
-                     mask=mask_n[:, None], other=0.0)
-        vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
-                             (BLOCK_N, HEAD_DIM))
-
-        l_i = l_i * alpha + tl.sum(p[None, :], axis=1)
-        acc = acc * alpha + tl.sum(p[:, None] * v_i8.to(tl.float32) * vs_full, axis=0)
-        m_i = m_new
-
-    if WRITE_MID:
-        base = mid_ptr + (seq_idx * num_heads + head_idx) * stride_mid_sh + split_idx * stride_mid_ss
-        one = tl.arange(0, 1)
-        tl.store(base + one, m_i)
-        tl.store(base + 1 + one, l_i)
-        tl.store(base + 2 + offs_d, acc)
-    else:
-        acc = acc / l_i
-        tl.store(o_ptr + seq_idx * stride_on + head_idx * stride_oh + offs_d,
-                 acc.to(o_ptr.dtype.element_ty))
 
 
 def triton_paged_attention_int8(
@@ -789,7 +717,7 @@ def triton_paged_attention_int8(
 
     o = torch.empty_like(q)
     if num_splits == 1:
-        _paged_attn_decode_int8_kernel[(num_seqs, num_heads, 1)](
+        _paged_attn_decode_kernel[(num_seqs, num_heads, 1)](
             q, k_cache, v_cache, k_scale, v_scale, o, o,   # mid_ptr unused
             block_tables, context_lens,
             scale,
@@ -801,6 +729,7 @@ def triton_paged_attention_int8(
             o.stride(0), o.stride(1),
             0, 0,                                         # mid strides unused
             block_tables.stride(0),
+            IS_INT8=True,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             HEAD_DIM=head_dim,
@@ -816,7 +745,7 @@ def triton_paged_attention_int8(
 
     # See the BF16 wrapper: every split slot is written unconditionally.
     mid = _get_mid(mid, num_seqs, num_heads, num_splits, head_dim, q.device)
-    _paged_attn_decode_int8_kernel[(num_seqs, num_heads, num_splits)](
+    _paged_attn_decode_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, k_scale, v_scale, o, mid,
         block_tables, context_lens,
         scale,
@@ -828,6 +757,7 @@ def triton_paged_attention_int8(
         o.stride(0), o.stride(1),
         mid.stride(0), mid.stride(1),
         block_tables.stride(0),
+        IS_INT8=True,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
