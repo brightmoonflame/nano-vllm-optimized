@@ -87,7 +87,7 @@ def test_w8a16_loaders_quantize_after_tp_sharding(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("m,n,k", [(1, 128, 96), (17, 256, 128), (65, 512, 256)])
-def test_triton_w8a16_matches_dequant_reference(dtype, m, n, k):
+def test_triton_w8a16_matches_fused_reference(dtype, m, n, k):
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
     weight = torch.randn(n, k, device="cuda", dtype=dtype)
