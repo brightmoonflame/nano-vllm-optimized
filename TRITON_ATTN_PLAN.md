@@ -311,8 +311,19 @@ Config.use_triton_attn
 
 ## 5.5 阶段五:prefix cache paged prefill(补充项)
 
-> **状态:已实现(BF16 + INT8)。** 自研 Triton 内核已覆盖 prefix-cache 命中的 prefill(`triton_flash_attn_varlen_paged` / `triton_flash_attn_varlen_paged_int8`)。
+> **状态:已实现(BF16 + INT8)。** 自研 Triton 内核已覆盖 prefix-cache 命中的 prefill(统一入口 `triton_flash_attn_varlen`,`IS_PAGED` / `IS_INT8` 编译期分支)。
 > 剩余回退仅一处:sliding window(明确不管)。
+
+### 端到端验证(chunked prefill / spec decode)
+
+阶段五完成后,chunked prefill 与 spec decode 的 verify 均为「prefill 语义 + `block_tables` 非 None」,自动命中自研 paged prefill 内核。`bench_triton_e2e.py` 冒烟验证结论:
+
+| 路径 | 冒烟 | 确定性(同配置跑两次) | token-match vs flash_attn |
+|------|------|----------------------|---------------------------|
+| chunked prefill | PASS | — | 98.83%(内核差异 + 级联,正常) |
+| spec decode | PASS | PASS(bit-identical) | 69.92%(accept/reject 二元放大,正常) |
+
+> token-match 不是 100% 是**预期**:自研 Triton 与 flash_attn(CUTLASS)是两套独立实现,logits 对齐精度 ~1e-3(`tests/` 已钉住),greedy 解码级联放大该差异。确定性 PASS 排除了未初始化内存读/race。功能正确性以 logits 数值对齐(`test_triton_attn.py`)+ 冒烟 + 确定性为准,而非 token-identity。
 
 **目标**:打通「prefill 读 paged cache」——当 `block_tables is not None`(prefix cache 命中)时,prefill 的 k/v 从分页 KV cache 读历史前缀,而非新算的稠密张量。这是阶段一坑 2 绕开的场景。
 
