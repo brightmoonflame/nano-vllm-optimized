@@ -21,6 +21,7 @@ _log("importing triton kernel ...")
 from nanovllm.layers.triton_attn import (
     triton_flash_attn_varlen,
     triton_flash_attn_varlen_paged,
+    triton_flash_attn_varlen_paged_int8,
     triton_paged_attention,
     triton_paged_attention_int8,
 )
@@ -149,6 +150,78 @@ def test_prefill_paged_gqa_4to1_long():
     # prefix 1000 + new 500 crosses several blocks.
     _run_prefill_paged_case("prefill_paged_gqa_4to1(prefix1000,new500)", num_heads=16, num_kv_heads=4, head_dim=128,
                             prefixes=[1000], new_lens=[500])
+
+
+def _run_prefill_paged_int8_case(name, num_heads, num_kv_heads, head_dim, prefixes, new_lens,
+                                 block_size=256, dtype=torch.bfloat16):
+    """INT8 paged prefill (prefix-cache hit + kv_quant): queries are the new
+    tokens; K/V are read from the INT8 paged cache and dequantized in-register."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_seqs = len(prefixes)
+    scale = head_dim ** -0.5
+
+    seqlens_k = [p + n for p, n in zip(prefixes, new_lens)]   # prefix + new
+    total_q = sum(new_lens)
+
+    # Shuffled physical-block assignment (exercises block_table addressing).
+    blocks_per_seq = [(l + block_size - 1) // block_size for l in seqlens_k]
+    total_logical = sum(blocks_per_seq)
+    pool = torch.randperm(total_logical).tolist()
+    max_blocks = max(blocks_per_seq)
+    rows, ptr = [], 0
+    for nb in blocks_per_seq:
+        rows.append(pool[ptr:ptr + nb] + [0] * (max_blocks - nb))
+        ptr += nb
+    block_tables = torch.tensor(rows, dtype=torch.int32, device=device)
+
+    num_physical = total_logical
+    k_i8, k_sc = _quantize_groupwise(torch.randn(num_physical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
+    v_i8, v_sc = _quantize_groupwise(torch.randn(num_physical, block_size, num_kv_heads, head_dim, dtype=dtype, device=device))
+    q = torch.randn(total_q, num_heads, head_dim, dtype=dtype, device=device)
+
+    cu_q = torch.cat([torch.zeros(1, dtype=torch.int32),
+                      torch.tensor(new_lens, dtype=torch.int32).cumsum(0)]).to(device)
+    cu_k = torch.cat([torch.zeros(1, dtype=torch.int32),
+                      torch.tensor(seqlens_k, dtype=torch.int32).cumsum(0)]).to(device)
+    max_q = max(new_lens)
+
+    # Reference: whole-cache dequant to BF16, then flash_attn paged prefill —
+    # the exact fallback path the fused kernel replaces.
+    _log(f"[{name}] running dequant + flash_attn_varlen_func (reference) ...")
+    k_bf16 = dequant_kvcache(k_i8, k_sc)
+    v_bf16 = dequant_kvcache(v_i8, v_sc)
+    ref = flash_attn_varlen_func(
+        q, k_bf16, v_bf16,
+        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+        max_seqlen_q=max_q, max_seqlen_k=max(seqlens_k),
+        softmax_scale=scale, causal=True,
+        block_table=block_tables,
+    )
+
+    _log(f"[{name}] running triton_flash_attn_varlen_paged_int8 (first call triggers JIT compile) ...")
+    out = triton_flash_attn_varlen_paged_int8(
+        q, k_i8, v_i8, k_sc, v_sc, cu_q, cu_k, max_q, block_tables, scale)
+
+    max_abs_err = (out - ref).abs().max().item()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+    _log(f"[{name}] PASSED  max_abs_err={max_abs_err:.4e}")
+
+
+def test_prefill_paged_int8_single_prefix():
+    _run_prefill_paged_int8_case("prefill_paged_int8_mha(prefix200,new100)", num_heads=8, num_kv_heads=8, head_dim=128,
+                                 prefixes=[200], new_lens=[100])
+
+
+def test_prefill_paged_int8_multi_mixed():
+    # Mix: no-prefix (start=0, must match dense), mid-prefix, cross-block prefix.
+    _run_prefill_paged_int8_case("prefill_paged_int8_multi(0/64/200,128/96/50)", num_heads=8, num_kv_heads=8, head_dim=128,
+                                 prefixes=[0, 64, 200], new_lens=[128, 96, 50])
+
+
+def test_prefill_paged_int8_gqa_3to1():
+    _run_prefill_paged_int8_case("prefill_paged_int8_gqa_3to1(prefix300,new200)", num_heads=24, num_kv_heads=8, head_dim=128,
+                                 prefixes=[300], new_lens=[200])
 
 
 def _run_decode_case(name, num_heads, num_kv_heads, head_dim, ctx_lens,
@@ -368,6 +441,9 @@ if __name__ == "__main__":
     test_prefill_paged_multi_mixed()
     test_prefill_paged_gqa_3to1()
     test_prefill_paged_gqa_4to1_long()
+    test_prefill_paged_int8_single_prefix()
+    test_prefill_paged_int8_multi_mixed()
+    test_prefill_paged_int8_gqa_3to1()
     test_decode_mha_partial_blocks()
     test_decode_multi_seq_uneven()
     test_decode_gqa_3to1()
@@ -378,4 +454,4 @@ if __name__ == "__main__":
     test_decode_int8_gqa_4to1_long()
     test_decode_splitk_consistency()
     test_decode_splitk_consistency_int8()
-    print("All precision tests passed (prefill FA2 dense+paged + decode paged + INT8 fused + flash-decoding).", flush=True)
+    print("All precision tests passed (prefill FA2 dense+paged BF16/INT8 + decode paged BF16/INT8 + flash-decoding).", flush=True)

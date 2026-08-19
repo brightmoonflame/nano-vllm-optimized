@@ -395,6 +395,176 @@ def triton_flash_attn_varlen_paged(
 
 
 @triton.jit
+def _fwd_kernel_paged_int8(
+    q_ptr, k_cache_ptr, v_cache_ptr, k_scale_ptr, v_scale_ptr, o_ptr,
+    cu_seqlens_q_ptr, cu_seqlens_k_ptr,
+    block_tables_ptr,
+    stride_qn, stride_qh,
+    stride_kb, stride_kt, stride_kh,
+    stride_vb, stride_vt, stride_vh,
+    stride_ksc_b, stride_ksc_t,
+    stride_vsc_b, stride_vsc_t,
+    stride_on, stride_oh,
+    stride_bt,
+    scale,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """FA2 prefill for the INT8 prefix-cache case.
+
+    Same structure as `_fwd_kernel_paged` (queries = newly-scheduled tokens,
+    keys/values read from the paged cache with offset causal), except K/V are
+    INT8 and dequantized in-register (int8 × group scale) back to the query
+    dtype before the dot products. Unlike the decode kernel — which uses an
+    fp32 element-wise sum because it has a single query (BLOCK_M=1) — prefill
+    has BLOCK_M=128 queries, so an fp32 (BLOCK_M, BLOCK_N, HEAD_DIM) product
+    would explode registers; dequantizing to bf16 and using tl.dot keeps it
+    tiled. This matches the reference `dequant_kvcache` (which also dequantizes
+    to bf16), so precision is identical up to the same bf16 rounding.
+    """
+    m_block = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    seq_idx = tl.program_id(2)
+
+    seq_start_q = tl.load(cu_seqlens_q_ptr + seq_idx)
+    seq_end_q = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
+    seq_start_k = tl.load(cu_seqlens_k_ptr + seq_idx)
+    seq_end_k = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
+    seqlen_q = seq_end_q - seq_start_q
+    seqlen_k = seq_end_k - seq_start_k
+    start = seqlen_k - seqlen_q   # cached prefix length
+
+    m_start = m_block * BLOCK_M
+    if m_start >= seqlen_q:
+        return
+
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+
+    offs_m = m_start + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_g = tl.arange(0, NUM_GROUPS)
+    mask_m = offs_m < seqlen_q
+
+    q_ptrs = q_ptr + (seq_start_q + offs_m)[:, None] * stride_qn + head_idx * stride_qh + offs_d[None, :]
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+
+    m_i = tl.full((BLOCK_M,), value=float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+
+    n_end = tl.minimum(start + m_start + BLOCK_M, seqlen_k)
+    for n_start in range(0, n_end, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)                     # global positions (mask)
+        mask_n = offs_n < seqlen_k
+        offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)  # within-block (addressing)
+        physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
+
+        # --- K: int8 -> group-scale dequant -> query dtype, then standard dot ---
+        k_off = (physical_block.to(tl.int64) * stride_kb
+                 + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
+        k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
+        ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
+                     + offs_in_block[:, None] * stride_ksc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                     mask=mask_n[:, None], other=0.0)                  # (BLOCK_N, NUM_GROUPS)
+        ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                             (BLOCK_N, HEAD_DIM))
+        k = (k_i8.to(tl.float32) * ks_full).to(q_ptr.dtype.element_ty)
+
+        qk = tl.dot(q, tl.trans(k)) * scale
+        causal_mask = (start + offs_m)[:, None] >= offs_n[None, :]
+        qk = tl.where(causal_mask & mask_n[None, :], qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        # --- V: same group-wise dequant ---
+        v_off = (physical_block.to(tl.int64) * stride_vb
+                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
+        v_i8 = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
+        vs = tl.load(v_scale_ptr + physical_block.to(tl.int64) * stride_vsc_b
+                     + offs_in_block[:, None] * stride_vsc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
+                     mask=mask_n[:, None], other=0.0)
+        vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
+                             (BLOCK_N, HEAD_DIM))
+        v = (v_i8.to(tl.float32) * vs_full).to(q_ptr.dtype.element_ty)
+
+        acc += tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+    o_ptrs = o_ptr + (seq_start_q + offs_m)[:, None] * stride_on + head_idx * stride_oh + offs_d[None, :]
+    tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=mask_m[:, None])
+
+
+def triton_flash_attn_varlen_paged_int8(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    block_tables: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """INT8 counterpart of `triton_flash_attn_varlen_paged` (prefix-cache hit,
+    kv_quant=True). Same interface as the BF16 wrapper plus the INT8 scales.
+
+    k_cache/v_cache: (num_blocks, block_size, num_kv_heads, head_dim) INT8
+    k_scale/v_scale: (num_blocks, block_size, num_kv_heads, NUM_GROUPS) FP32
+    """
+    total_q, num_heads, head_dim = q.shape
+    num_blocks, block_size, num_kv_heads, _ = k_cache.shape
+    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+    assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1, "head_dim must be contiguous"
+    assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
+    assert head_dim % NUM_GROUPS == 0
+    assert block_size % 64 == 0, "block_size must be a multiple of BLOCK_N=64 (single tile per block)"
+
+    o = torch.empty_like(q)
+    num_seqs = cu_seqlens_q.numel() - 1
+    BLOCK_M = 128
+    BLOCK_N = 64
+    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
+
+    _fwd_kernel_paged_int8[grid](
+        q, k_cache, v_cache, k_scale, v_scale, o,
+        cu_seqlens_q, cu_seqlens_k,
+        block_tables,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        k_scale.stride(0), k_scale.stride(1),
+        v_scale.stride(0), v_scale.stride(1),
+        o.stride(0), o.stride(1),
+        block_tables.stride(0),
+        scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        HEAD_DIM=head_dim,
+        GROUP_SIZE=head_dim // NUM_GROUPS,
+        NUM_GROUPS=NUM_GROUPS,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+    )
+    return o
+
+
+@triton.jit
 def _paged_attn_decode_kernel(
     q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, mid_ptr,
     block_tables_ptr, context_lens_ptr,

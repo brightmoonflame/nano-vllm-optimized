@@ -250,12 +250,12 @@ Config.use_triton_attn
 
 > **注意**:prefill 的 INT8 融合需要「prefill 读 paged cache」这个能力先行,而这正是阶段五(prefix cache paged prefill)要做的事。所以 4b 排在阶段五之后,不阻塞阶段三/四的主线。
 >
-> 当前 `kv_quant.py` 注释写明"Prefill: unaffected (uses freshly computed K/V directly)"——普通 prefill 用新算的 BF16 K/V,不走 INT8 cache。所以 prefill 的 INT8 融合**仅对 prefix cache 命中时有意义**(读历史 INT8 cache)。
+> 判定结论:kv_quant=True 时 KV cache **整体以 INT8 存储**(含被 prefix cache 复用的历史 block),因此 prefix cache 命中时 prefill 读到的历史 KV 就是 INT8。此前该场景把 INT8 cache 直接传给 flash_attn(仅支持 BF16/FP16),是一个**真实的静默错误**,不是可选优化。
 
-- [ ] **4b-1**(条件性,依赖阶段五)若 prefix cache 的历史 KV 也以 INT8 存储,则在阶段五的 paged prefill FA2 内核里加 INT8 读取分支(读 INT8 → 反量化 → 进 QK 计算)
-  - 判定依据:`store_kvcache_int8` 是否对 prefix cache 的历史 KV 生效;若 prefix cache 始终 BF16,则 4b 整体跳过
+- [x] **4b-1**(依赖阶段五)prefix cache 的历史 KV 以 INT8 存储 → 在阶段五的 paged prefill FA2 内核里加 INT8 读取分支(读 INT8 → 反量化 → 进 QK 计算)
+  - 判定依据已确认:`store_kvcache_int8` 对 prefix cache 历史 KV 生效(cache dtype 由 `kv_quant` 决定)
 
-- [ ] **4b-2**(条件性)若 4b-1 判定需要,在 `_flash_attn_varlen_paged` 里加 `kv_quant=True` 的 INT8 读取路径
+- [x] **4b-2** 在 `triton_attn.py` 新增 `_fwd_kernel_paged_int8` + `triton_flash_attn_varlen_paged_int8`(INT8 读取 + group-scale 反量化到 bf16 后用 tl.dot);`attention.py` 的 INT8 prefix-cache 分支改走该内核
 
 ### 4c. 精度与性能验证
 
@@ -311,8 +311,8 @@ Config.use_triton_attn
 
 ## 5.5 阶段五:prefix cache paged prefill(补充项)
 
-> **状态:已实现(BF16)。** 自研 Triton 内核已覆盖 prefix-cache 命中的 prefill(`triton_flash_attn_varlen_paged`)。
-> 剩余回退仅两处:sliding window(明确不管)、INT8 prefix cache(即 4b,尚未融合,仍走 flash_attn 兜底)。
+> **状态:已实现(BF16 + INT8)。** 自研 Triton 内核已覆盖 prefix-cache 命中的 prefill(`triton_flash_attn_varlen_paged` / `triton_flash_attn_varlen_paged_int8`)。
+> 剩余回退仅一处:sliding window(明确不管)。
 
 **目标**:打通「prefill 读 paged cache」——当 `block_tables is not None`(prefix cache 命中)时,prefill 的 k/v 从分页 KV cache 读历史前缀,而非新算的稠密张量。这是阶段一坑 2 绕开的场景。
 

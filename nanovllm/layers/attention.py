@@ -9,6 +9,7 @@ from nanovllm.layers.kv_quant import store_kvcache_int8, dequant_kvcache
 from nanovllm.layers.triton_attn import (
     triton_flash_attn_varlen,
     triton_flash_attn_varlen_paged,
+    triton_flash_attn_varlen_paged_int8,
     triton_paged_attention,
     triton_paged_attention_int8,
 )
@@ -84,18 +85,19 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            # Triton FA2 covers dense prefill, paged prefill (prefix-cache hit,
-            # BF16 cache), and global attention. Sliding window, and the INT8
-            # prefix-cache case (not yet fused), still fall back to flash_attn.
-            use_triton = (
-                self.use_triton_attn
-                and self.sliding_window is None
-                and not (context.block_tables is not None and self.kv_quant)
-            )
+            # Triton FA2 covers dense prefill and paged prefill (prefix-cache
+            # hit) for both BF16 and INT8 caches. Only sliding window still
+            # falls back to flash_attn.
+            use_triton = self.use_triton_attn and self.sliding_window is None
             if use_triton:
                 if context.block_tables is None:
                     o = triton_flash_attn_varlen(q, k, v, context.cu_seqlens_q,
                                                  max_seqlen=context.max_seqlen_q, scale=self.scale)
+                elif self.kv_quant:
+                    o = triton_flash_attn_varlen_paged_int8(
+                        q, k, v, self.k_scale, self.v_scale,
+                        context.cu_seqlens_q, context.cu_seqlens_k,
+                        context.max_seqlen_q, context.block_tables, self.scale)
                 else:
                     o = triton_flash_attn_varlen_paged(q, k, v,
                                                        context.cu_seqlens_q, context.cu_seqlens_k,

@@ -10,7 +10,8 @@ calibration — scales are computed dynamically at store time.
 Store: BF16 K/V → INT8 cache + FP32 scale (num_groups per token per head).
 Decode: INT8 cache → BF16 buffer (fallback path) or dequantized in-register
         by the fused Triton kernel (main path).
-Prefill: unaffected (uses freshly computed K/V directly).
+Prefill: dense prefill uses freshly computed K/V directly; a prefix-cache hit
+         reads the INT8 cache via `triton_flash_attn_varlen_paged_int8`.
 """
 
 import torch
