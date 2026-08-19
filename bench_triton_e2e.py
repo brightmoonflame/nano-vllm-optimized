@@ -106,10 +106,15 @@ def test_spec(model, draft_model, max_tokens):
     print(f"\n[speculative decode] {num_seqs} prompts, K=5, max_tokens={max_tokens}")
     ref = run_once(model, prompts, sp, use_triton=False, speculative_config=spec_cfg)
     out = run_once(model, prompts, sp, use_triton=True, speculative_config=spec_cfg)
+    # Determinism: the same Triton config run twice must be bit-identical. If it
+    # is not, the kernels read uninitialized memory / have a race — a real bug.
+    out2 = run_once(model, prompts, sp, use_triton=True, speculative_config=spec_cfg)
 
     rate, d = _match_rate(ref, out)
-    ok = _smoke_ok(out, max_tokens)
+    deterministic = all(a == b for a, b in zip(out, out2))
+    ok = _smoke_ok(out, max_tokens) and deterministic
     print(f"  token-match vs baseline: {rate * 100:.2f}%  (first divergence at token {d})")
+    print(f"  determinism (triton x2): {'PASS' if deterministic else 'FAIL'}")
     print(f"  smoke (use_triton_attn=True): {'PASS' if ok else 'FAIL'}")
     return ok, rate
 
