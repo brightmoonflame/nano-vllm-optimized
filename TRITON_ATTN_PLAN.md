@@ -423,3 +423,17 @@ prefix cache prefill = FA2 内核 + paged k/v 寻址 + 错位 causal + 双 cu_se
 - **FP8 KV cache**:INT8 跑通后再考虑,量化路径不同(scale 是 FP32 单值 vs FP8 E4M3),先不做。
 - **prefill chunked 的分段 CUDA Graph**:独立优化项,见后续计划。
 - **多卡 TP 下的 attention**:当前 attention kernel 是单卡内的,TP 通信在 attention 之外,本计划不涉及。
+
+---
+
+## 10. 后续重构：内核统一化（已完成）
+
+主线完成后,`triton_attn.py` 因"每新增一种场景就复制一份内核"膨胀到 **6 内核 + 5 wrapper**(dense/paged/int8 三个 prefill、bf16/int8 两个 decode)。这是"改漏一处"类 bug 的温床(如 INT8 scale load 曾缺 `NUM_GROUPS` 维)。参照业界做法(vLLM 将 prefill/decode 拆为专门内核,同构变体用 Triton `tl.constexpr` 编译期特化统一),分三步渐进合并:
+
+| 步骤 | 内容 | commit |
+|------|------|--------|
+| Step 1 | prefill 3 内核 → 1 个 `_fwd_kernel`(`IS_PAGED` × `IS_INT8`) | `702d2be` |
+| Step 2 | decode 2 内核 → 1 个 `_paged_attn_decode_kernel`(`IS_INT8`) | `64b3c3e` |
+| Step 3 | 5 wrapper → 2 个统一入口(`triton_flash_attn_varlen` / `triton_paged_attention`) | `bcc350c` |
+
+最终 **3 内核 + 2 wrapper**,净减约 364 行。`tl.constexpr` 是编译期特化,每个变体编译后仍只含自己的代码路径(**零运行时开销**);18 个精度用例 + 端到端 `bench_teacher_forced.py` 全绿,结果与重构前完全一致(agreement 99.46%、ΔPPL +0.000)。

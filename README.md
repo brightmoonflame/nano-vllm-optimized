@@ -247,7 +247,7 @@ Prefill processes hundreds to thousands of tokens per step, so kernel-launch ove
 
 ## Triton Attention Kernels
 
-Self-researched Triton kernels replace the `flash_attn` package on the prefill and decode paths, gated behind `use_triton_attn` (default off). Four pieces: FlashAttention-2 prefill, paged-attention decode, fused INT8 dequant decode, and Flash-Decoding (split-K).
+Self-researched Triton kernels replace the `flash_attn` package on the prefill and decode paths, gated behind `use_triton_attn` (default off). Two unified entry points — `triton_flash_attn_varlen` (prefill: dense / paged / INT8) and `triton_paged_attention` (decode: BF16 / INT8) — backed by three Triton kernels (`_fwd_kernel`, `_paged_attn_decode_kernel`, `_split_reduce_kernel`). Together they cover FlashAttention-2 prefill, paged-attention decode, fused INT8 dequant, and Flash-Decoding (split-K). Variants are selected at compile time via `IS_PAGED` / `IS_INT8` `tl.constexpr` switches, so every compiled kernel contains only its own code path (zero runtime dispatch overhead).
 
 Hardware: Llama-3.2-3B-Instruct (24 Q / 8 KV heads, GQA 3:1), single RTX 4090.
 
