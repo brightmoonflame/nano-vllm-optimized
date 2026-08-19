@@ -1,8 +1,11 @@
 """Self-researched Triton attention kernels (forward-only).
 
-Stage 1 — prefill: a dense (non-paged) varlen FlashAttention-2 kernel, a
-drop-in alternative to `flash_attn_varlen_func` for the common case
-(`context.block_tables is None`, i.e. no prefix-cache hit).
+Stage 1 — prefill: varlen FlashAttention-2 kernels, drop-in alternatives to
+`flash_attn_varlen_func`:
+  - dense (no prefix-cache hit): `triton_flash_attn_varlen`
+  - paged (prefix-cache hit, K/V read from the paged cache via block_tables):
+    `triton_flash_attn_varlen_paged` — queries are the newly-scheduled tokens
+    while keys include the cached prefix (dual cu_seqlens_q/k + offset causal).
 
 Stage 2 — decode: a single-query paged attention kernel, a drop-in
 alternative to `flash_attn_with_kvcache` (BF16 path), reading K/V directly
@@ -239,6 +242,153 @@ def triton_flash_attn_varlen(
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        num_warps=8,
+    )
+    return o
+
+
+@triton.jit
+def _fwd_kernel_paged(
+    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
+    cu_seqlens_q_ptr, cu_seqlens_k_ptr,
+    block_tables_ptr,
+    stride_qn, stride_qh,
+    stride_kb, stride_kt, stride_kh,
+    stride_vb, stride_vt, stride_vh,
+    stride_on, stride_oh,
+    stride_bt,
+    scale,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """FA2 forward for prefix-cache prefill: queries are the newly-scheduled
+    tokens, keys/values live in the paged cache (prefix + new tokens)."""
+    m_block = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    seq_idx = tl.program_id(2)
+
+    seq_start_q = tl.load(cu_seqlens_q_ptr + seq_idx)
+    seq_end_q = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
+    seq_start_k = tl.load(cu_seqlens_k_ptr + seq_idx)
+    seq_end_k = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
+    seqlen_q = seq_end_q - seq_start_q
+    seqlen_k = seq_end_k - seq_start_k
+    start = seqlen_k - seqlen_q   # cached prefix length (num_cached_tokens)
+
+    m_start = m_block * BLOCK_M
+    if m_start >= seqlen_q:
+        return
+
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+
+    offs_m = m_start + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    mask_m = offs_m < seqlen_q
+
+    q_ptrs = q_ptr + (seq_start_q + offs_m)[:, None] * stride_qn + head_idx * stride_qh + offs_d[None, :]
+    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+
+    m_i = tl.full((BLOCK_M,), value=float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+
+    # Offset causal: query row at global position (start + offs_m) attends keys
+    # [0, start + offs_m]. The last row needs keys up to start + m_start + BLOCK_M - 1,
+    # so the exclusive loop bound is +1, clamped to the actual key length.
+    n_end = tl.minimum(start + m_start + BLOCK_M, seqlen_k)
+    for n_start in range(0, n_end, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)                     # global key positions
+        mask_n = offs_n < seqlen_k
+        offs_in_block = n_start % BLOCK_SIZE + tl.arange(0, BLOCK_N)  # within-block (addressing)
+        physical_block = tl.load(block_tables_ptr + seq_idx * stride_bt + n_start // BLOCK_SIZE)
+
+        k_off = (physical_block.to(tl.int64) * stride_kb
+                 + offs_in_block[:, None] * stride_kt + kv_head_idx * stride_kh + offs_d[None, :])
+        k = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
+
+        qk = tl.dot(q, tl.trans(k)) * scale
+        causal_mask = (start + offs_m)[:, None] >= offs_n[None, :]
+        qk = tl.where(causal_mask & mask_n[None, :], qk, float("-inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+
+        v_off = (physical_block.to(tl.int64) * stride_vb
+                 + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
+        v = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
+        acc += tl.dot(p.to(v.dtype), v)
+
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+    o_ptrs = o_ptr + (seq_start_q + offs_m)[:, None] * stride_on + head_idx * stride_oh + offs_d[None, :]
+    tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=mask_m[:, None])
+
+
+def triton_flash_attn_varlen_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    block_tables: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """FlashAttention-2 forward, causal, GQA, paged-varlen prefill.
+
+    Covers the prefix-cache case: queries are the newly-scheduled tokens
+    (positions start..end in the sequence), while K/V live in the paged KV
+    cache and include the cached prefix. `cu_seqlens_q` bounds the queries,
+    `cu_seqlens_k` bounds the keys (prefix + new tokens), and `block_tables`
+    maps logical -> physical blocks. With `start == 0` for every seq this
+    reduces to the dense kernel.
+
+    q: (total_q, num_heads, head_dim)
+    k_cache, v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
+    cu_seqlens_q, cu_seqlens_k: (num_seqs + 1,) int32
+    block_tables: (num_seqs, max_blocks) int32
+
+    Returns a tensor shaped like q.
+    """
+    total_q, num_heads, head_dim = q.shape
+    num_blocks, block_size, num_kv_heads, _ = k_cache.shape
+    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+    assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1, "head_dim must be contiguous"
+    assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
+    assert block_size % 64 == 0, "block_size must be a multiple of BLOCK_N=64 (single tile per block)"
+
+    o = torch.empty_like(q)
+    num_seqs = cu_seqlens_q.numel() - 1
+    BLOCK_M = 128
+    BLOCK_N = 64
+    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
+
+    _fwd_kernel_paged[grid](
+        q, k_cache, v_cache, o,
+        cu_seqlens_q, cu_seqlens_k,
+        block_tables,
+        q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        o.stride(0), o.stride(1),
+        block_tables.stride(0),
+        scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_SIZE=block_size,
         num_warps=8,
     )
     return o

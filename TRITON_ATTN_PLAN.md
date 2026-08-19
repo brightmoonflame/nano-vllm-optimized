@@ -311,9 +311,8 @@ Config.use_triton_attn
 
 ## 5.5 阶段五:prefix cache paged prefill(补充项)
 
-> **状态:未实现。** 主线(阶段一~四 + 精度验证)已完成;本阶段为可选完整性增强。
-> 当前 prefix-cache 命中 / chunked prefill 的 prefill chunk 正确回退到 `flash_attn_varlen_func`(非 bug),
-> 只是尚未被自研 Triton 内核覆盖。
+> **状态:已实现(BF16)。** 自研 Triton 内核已覆盖 prefix-cache 命中的 prefill(`triton_flash_attn_varlen_paged`)。
+> 剩余回退仅两处:sliding window(明确不管)、INT8 prefix cache(即 4b,尚未融合,仍走 flash_attn 兜底)。
 
 **目标**:打通「prefill 读 paged cache」——当 `block_tables is not None`(prefix cache 命中)时,prefill 的 k/v 从分页 KV cache 读历史前缀,而非新算的稠密张量。这是阶段一坑 2 绕开的场景。
 
@@ -337,16 +336,16 @@ prefix cache prefill = FA2 内核 + paged k/v 寻址 + 错位 causal + 双 cu_se
 
 ### 实现要点
 
-- [ ] **5.5-1** `triton_attn.py` 新增 `_flash_attn_varlen_paged()` kernel
-  - 基于阶段一 `_flash_attn_varlen_forward`(FA2)改造
+- [x] **5.5-1** `triton_attn.py` 新增 `_fwd_kernel_paged()` kernel
+  - 基于阶段一 `_fwd_kernel`(FA2)改造
   - k/v 读取:从 paged cache 按 `block_table` 间接寻址(复用阶段二 decode 的 block_table 逻辑)
   - 双 cu_seqlens + 错位 causal(上表)
 
-- [ ] **5.5-2** Python wrapper `triton_flash_attn_varlen_paged(q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, max_seqlen_k, block_tables, scale)`
+- [x] **5.5-2** Python wrapper `triton_flash_attn_varlen_paged(q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, block_tables, scale)`
 
-- [ ] **5.5-3** `attention.py` prefill 分支:`use_triton_attn=True` 且 `block_tables is not None` 时走新内核(此时 k/v 已是 `k_cache/v_cache`)
+- [x] **5.5-3** `attention.py` prefill 分支:`use_triton_attn=True` 且 `block_tables is not None` 且非 INT8 时走新内核(此时 k/v 已是 `k_cache/v_cache`)
 
-- [ ] **5.5-4** 精度对齐测试:prefix cache 场景对比 `flash_attn_varlen_func(block_table=...)`
+- [x] **5.5-4** 精度对齐测试:prefix cache 场景对比 `flash_attn_varlen_func(block_table=...)`(4 用例,待 GPU 验证)
 
 ### 触发场景与优先级
 
