@@ -106,9 +106,9 @@ def _run_prefill_paged_case(name, num_heads, num_kv_heads, head_dim, prefixes, n
     q = torch.randn(total_q, num_heads, head_dim, dtype=dtype, device=device)
 
     cu_q = torch.cat([torch.zeros(1, dtype=torch.int32),
-                      torch.tensor(new_lens, dtype=torch.int32).cumsum(0)]).to(device)
+                      torch.tensor(new_lens, dtype=torch.int32).cumsum(0).to(torch.int32)]).to(device)
     cu_k = torch.cat([torch.zeros(1, dtype=torch.int32),
-                      torch.tensor(seqlens_k, dtype=torch.int32).cumsum(0)]).to(device)
+                      torch.tensor(seqlens_k, dtype=torch.int32).cumsum(0).to(torch.int32)]).to(device)
     max_q = max(new_lens)
     max_k = max(seqlens_k)
 
@@ -181,9 +181,9 @@ def _run_prefill_paged_int8_case(name, num_heads, num_kv_heads, head_dim, prefix
     q = torch.randn(total_q, num_heads, head_dim, dtype=dtype, device=device)
 
     cu_q = torch.cat([torch.zeros(1, dtype=torch.int32),
-                      torch.tensor(new_lens, dtype=torch.int32).cumsum(0)]).to(device)
+                      torch.tensor(new_lens, dtype=torch.int32).cumsum(0).to(torch.int32)]).to(device)
     cu_k = torch.cat([torch.zeros(1, dtype=torch.int32),
-                      torch.tensor(seqlens_k, dtype=torch.int32).cumsum(0)]).to(device)
+                      torch.tensor(seqlens_k, dtype=torch.int32).cumsum(0).to(torch.int32)]).to(device)
     max_q = max(new_lens)
 
     # Reference: whole-cache dequant to BF16, then flash_attn paged prefill —
