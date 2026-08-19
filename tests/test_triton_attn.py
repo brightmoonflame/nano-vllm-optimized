@@ -298,7 +298,10 @@ def _quantize_groupwise(bf16_cache: torch.Tensor):
     x = bf16_cache.float().reshape(n, t, h, NUM_GROUPS, g)
     sc = x.abs().amax(dim=-1) / 127.0                                  # (n, t, h, NUM_GROUPS)
     sc = sc.clamp(min=1e-6)
-    i8 = torch.round(bf16_cache.float() / sc[..., None].reshape(n, t, h, 1, g).expand(n, t, h, NUM_GROUPS, g).reshape(n, t, h, d)) \
+    # sc is (n,t,h,NUM_GROUPS); sc[..., None] is (n,t,h,NUM_GROUPS,1) -> broadcast
+    # along head_dim's group size -> (n,t,h,NUM_GROUPS,g) -> (n,t,h,d). Mirrors the
+    # Triton kernel's `k_scale[:, None] -> broadcast_to -> reshape`.
+    i8 = torch.round(bf16_cache.float() / sc[..., None].expand(n, t, h, NUM_GROUPS, g).reshape(n, t, h, d)) \
         .clamp(-127, 127).to(torch.int8)
     return i8, sc
 
