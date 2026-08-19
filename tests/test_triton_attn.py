@@ -20,10 +20,7 @@ from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 _log("importing triton kernel ...")
 from nanovllm.layers.triton_attn import (
     triton_flash_attn_varlen,
-    triton_flash_attn_varlen_paged,
-    triton_flash_attn_varlen_paged_int8,
     triton_paged_attention,
-    triton_paged_attention_int8,
 )
 from nanovllm.layers.kv_quant import dequant_kvcache
 
@@ -54,7 +51,7 @@ def _run_case(name, num_heads, num_kv_heads, head_dim, seqlens, dtype=torch.bflo
     )
 
     _log(f"[{name}] running triton_flash_attn_varlen (first call triggers JIT compile) ...")
-    out = triton_flash_attn_varlen(q, k, v, cu_seqlens, max_seqlen=max_seqlen, scale=scale)
+    out = triton_flash_attn_varlen(q, k, v, cu_seqlens, max_seqlen_q=max_seqlen, scale=scale)
 
     max_abs_err = (out - ref).abs().max().item()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -121,8 +118,9 @@ def _run_prefill_paged_case(name, num_heads, num_kv_heads, head_dim, prefixes, n
         block_table=block_tables,
     )
 
-    _log(f"[{name}] running triton_flash_attn_varlen_paged (first call triggers JIT compile) ...")
-    out = triton_flash_attn_varlen_paged(q, k_cache, v_cache, cu_q, cu_k, max_q, block_tables, scale)
+    _log(f"[{name}] running triton_flash_attn_varlen (paged) (first call triggers JIT compile) ...")
+    out = triton_flash_attn_varlen(q, k_cache, v_cache, cu_q, max_seqlen_q=max_q, scale=scale,
+                                   cu_seqlens_k=cu_k, block_tables=block_tables)
 
     max_abs_err = (out - ref).abs().max().item()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -199,9 +197,10 @@ def _run_prefill_paged_int8_case(name, num_heads, num_kv_heads, head_dim, prefix
         block_table=block_tables,
     )
 
-    _log(f"[{name}] running triton_flash_attn_varlen_paged_int8 (first call triggers JIT compile) ...")
-    out = triton_flash_attn_varlen_paged_int8(
-        q, k_i8, v_i8, k_sc, v_sc, cu_q, cu_k, max_q, block_tables, scale)
+    _log(f"[{name}] running triton_flash_attn_varlen (paged int8) (first call triggers JIT compile) ...")
+    out = triton_flash_attn_varlen(
+        q, k_i8, v_i8, cu_q, max_seqlen_q=max_q, scale=scale,
+        cu_seqlens_k=cu_k, block_tables=block_tables, k_scale=k_sc, v_scale=v_sc)
 
     max_abs_err = (out - ref).abs().max().item()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -341,8 +340,9 @@ def _run_decode_int8_case(name, num_heads, num_kv_heads, head_dim, ctx_lens,
         softmax_scale=scale, causal=True,
     ).squeeze(1)
 
-    _log(f"[{name}] running triton_paged_attention_int8 (first call triggers JIT compile) ...")
-    out = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale)
+    _log(f"[{name}] running triton_paged_attention (int8) (first call triggers JIT compile) ...")
+    out = triton_paged_attention(q, k_i8, v_i8, block_tables, context_lens, scale,
+                                 k_scale=k_sc, v_scale=v_sc)
 
     max_abs_err = (out - ref).abs().max().item()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
@@ -422,8 +422,10 @@ def test_decode_splitk_consistency_int8():
     q = torch.randn(1, num_heads, head_dim, dtype=torch.bfloat16, device=device)
     context_lens = torch.tensor([ctx_len], dtype=torch.int32, device=device)
 
-    single = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale, num_splits=1)
-    multi = triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale, num_splits=64)
+    single = triton_paged_attention(q, k_i8, v_i8, block_tables, context_lens, scale, num_splits=1,
+                                    k_scale=k_sc, v_scale=v_sc)
+    multi = triton_paged_attention(q, k_i8, v_i8, block_tables, context_lens, scale, num_splits=64,
+                                   k_scale=k_sc, v_scale=v_sc)
 
     diff = (multi - single).abs()
     nan_mask = torch.isnan(diff)

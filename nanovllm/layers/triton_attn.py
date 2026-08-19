@@ -1,25 +1,23 @@
 """Self-researched Triton attention kernels (forward-only).
 
-Stage 1 — prefill: varlen FlashAttention-2 kernels, drop-in alternatives to
-`flash_attn_varlen_func`:
-  - dense (no prefix-cache hit): `triton_flash_attn_varlen`
-  - paged (prefix-cache hit, K/V read from the paged cache via block_tables):
-    `triton_flash_attn_varlen_paged` — queries are the newly-scheduled tokens
-    while keys include the cached prefix (dual cu_seqlens_q/k + offset causal).
+Two unified entry points, each a drop-in alternative to the corresponding
+flash_attn function, selected by optional arguments via compile-time switches:
 
-Stage 2 — decode: a single-query paged attention kernel, a drop-in
-alternative to `flash_attn_with_kvcache` (BF16 path), reading K/V directly
-from the paged KV cache via `block_tables`.
+  triton_flash_attn_varlen  — FlashAttention-2 forward (prefill).
+      IS_PAGED=False: dense varlen; True: paged (prefix-cache hit, K/V read
+      from the paged cache via block_tables + dual cu_seqlens_q/k + offset
+      causal). IS_INT8=True additionally dequantizes the INT8 cache in-register.
 
-Stage 3 — INT8 fused decode: reads the INT8 paged cache directly and
-dequantizes in-register (no whole-cache dequant pass).
+  triton_paged_attention     — single-query paged attention (decode), BF16 by
+      default; IS_INT8=True reads the INT8 paged cache directly and dequantizes
+      in-register (no whole-cache dequant pass).
 
-Flash-Decoding (Dao et al., Stanford CRFM 2023) on both decode kernels:
+Flash-Decoding (Dao et al., Stanford CRFM 2023) on the decode kernel:
 the KV dimension is additionally partitioned into splits so small batches
 still saturate the GPU. Each split computes an unnormalized local
 (m, l, acc); a shared reduce kernel merges them with the standard
 max-rescale formula. Large batches degenerate to the single-split path
-(WRITE_MID=False), which is identical to the non-split kernel.
+(WRITE_MID=False), which is identical to the non-split path.
 
 All kernels are gated behind `Attention.use_triton_attn` in `attention.py`
 — default behavior (flash_attn package) is untouched.
@@ -258,174 +256,86 @@ def triton_flash_attn_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
     scale: float,
+    cu_seqlens_k: torch.Tensor | None = None,
+    block_tables: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FlashAttention-2 forward, causal, GQA, dense varlen-packed layout.
+    """Unified FlashAttention-2 forward (prefill), causal, GQA.
 
-    q: (total_tokens, num_heads, head_dim)
-    k, v: (total_tokens, num_kv_heads, head_dim)
-    cu_seqlens: (num_seqs + 1,) int32 — shared boundary for q and k/v (this
-        kernel only covers the no-prefix-cache case, where cu_seqlens_q ==
-        cu_seqlens_k; prefix-cache/paged prefill still falls back to
-        `flash_attn_varlen_func`, see attention.py).
+    One entry point for all prefill variants, selected by which optional
+    arguments are passed:
+
+      dense (no prefix cache):
+        k/v are (total_tokens, num_kv_heads, head_dim); omit cu_seqlens_k,
+        block_tables, k_scale, v_scale.
+      paged BF16 (prefix-cache hit):
+        k/v are the (num_blocks, block_size, num_kv_heads, head_dim) cache;
+        pass cu_seqlens_k (prefix + new tokens) and block_tables.
+      paged INT8 (prefix-cache hit + kv_quant):
+        additionally pass k_scale/v_scale.
 
     Returns a tensor shaped like q.
     """
-    total_tokens, num_heads, head_dim = q.shape
-    num_kv_heads = k.shape[1]
-    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "head_dim must be contiguous"
+    IS_PAGED = block_tables is not None
+    IS_INT8 = k_scale is not None
+    assert (k_scale is None) == (v_scale is None), "k_scale and v_scale must be passed together"
+    if cu_seqlens_k is None:
+        cu_seqlens_k = cu_seqlens_q
+
+    total_q, num_heads, head_dim = q.shape
     assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "head_dim must be contiguous"
+
+    if IS_PAGED:
+        num_kv_heads = k.shape[2]
+        block_size = k.shape[1]
+        assert block_size % 64 == 0, "block_size must be a multiple of BLOCK_N=64 (single tile per block)"
+        stride_kt, stride_kh, stride_kb = k.stride(1), k.stride(2), k.stride(0)
+        stride_vt, stride_vh, stride_vb = v.stride(1), v.stride(2), v.stride(0)
+        bt = block_tables
+        bt_stride = block_tables.stride(0)
+    else:
+        num_kv_heads = k.shape[1]
+        block_size = 1                       # unused when IS_PAGED=False
+        stride_kt, stride_kh, stride_kb = k.stride(0), k.stride(1), 0
+        stride_vt, stride_vh, stride_vb = v.stride(0), v.stride(1), 0
+        bt = k                               # dummy (IS_PAGED=False never dereferences)
+        bt_stride = 0
+
+    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
+
+    if IS_INT8:
+        assert head_dim % NUM_GROUPS == 0
+        ksc_b, ksc_t = k_scale.stride(0), k_scale.stride(1)
+        vsc_b, vsc_t = v_scale.stride(0), v_scale.stride(1)
+    else:
+        k_scale = v_scale = k               # dummy (IS_INT8=False never dereferences)
+        ksc_b = ksc_t = vsc_b = vsc_t = 0
 
     o = torch.empty_like(q)
-    num_seqs = cu_seqlens.numel() - 1
+    num_seqs = cu_seqlens_q.numel() - 1
     BLOCK_M = 128
     BLOCK_N = 64
-    grid = (triton.cdiv(max_seqlen, BLOCK_M), num_heads, num_seqs)
+    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
 
-    # Dense path: cu_seqlens_k == cu_seqlens_q; paged-only params are dummies
-    # (never dereferenced when IS_PAGED=False / IS_INT8=False).
     _fwd_kernel[grid](
         q, k, v, o,
-        cu_seqlens, cu_seqlens,
-        k, k, k,                       # block_tables / k_scale / v_scale (dummy)
-        q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1), 0,   # stride_kt, stride_kh, stride_kb
-        v.stride(0), v.stride(1), 0,
-        0, 0, 0, 0,                    # scale strides (dummy)
-        o.stride(0), o.stride(1),
-        0,                             # stride_bt (dummy)
-        scale,
-        IS_PAGED=False,
-        IS_INT8=False,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        HEAD_DIM=head_dim,
-        GROUP_SIZE=head_dim // NUM_GROUPS,
-        NUM_GROUPS=NUM_GROUPS,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_SIZE=1,                  # unused when IS_PAGED=False
-        num_warps=8,
-    )
-    return o
-
-
-def triton_flash_attn_varlen_paged(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    block_tables: torch.Tensor,
-    scale: float,
-) -> torch.Tensor:
-    """FlashAttention-2 forward, causal, GQA, paged-varlen prefill.
-
-    Covers the prefix-cache case: queries are the newly-scheduled tokens
-    (positions start..end in the sequence), while K/V live in the paged KV
-    cache and include the cached prefix. `cu_seqlens_q` bounds the queries,
-    `cu_seqlens_k` bounds the keys (prefix + new tokens), and `block_tables`
-    maps logical -> physical blocks. With `start == 0` for every seq this
-    reduces to the dense kernel.
-
-    q: (total_q, num_heads, head_dim)
-    k_cache, v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
-    cu_seqlens_q, cu_seqlens_k: (num_seqs + 1,) int32
-    block_tables: (num_seqs, max_blocks) int32
-
-    Returns a tensor shaped like q.
-    """
-    total_q, num_heads, head_dim = q.shape
-    num_blocks, block_size, num_kv_heads, _ = k_cache.shape
-    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
-    assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1, "head_dim must be contiguous"
-    assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
-    assert block_size % 64 == 0, "block_size must be a multiple of BLOCK_N=64 (single tile per block)"
-
-    o = torch.empty_like(q)
-    num_seqs = cu_seqlens_q.numel() - 1
-    BLOCK_M = 128
-    BLOCK_N = 64
-    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
-
-    _fwd_kernel[grid](
-        q, k_cache, v_cache, o,
         cu_seqlens_q, cu_seqlens_k,
-        block_tables,
-        k_cache, k_cache,              # k_scale / v_scale (dummy, IS_INT8=False)
-        q.stride(0), q.stride(1),
-        k_cache.stride(1), k_cache.stride(2), k_cache.stride(0),   # stride_kt, stride_kh, stride_kb
-        v_cache.stride(1), v_cache.stride(2), v_cache.stride(0),
-        0, 0, 0, 0,                    # scale strides (dummy)
-        o.stride(0), o.stride(1),
-        block_tables.stride(0),
-        scale,
-        IS_PAGED=True,
-        IS_INT8=False,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        HEAD_DIM=head_dim,
-        GROUP_SIZE=head_dim // NUM_GROUPS,
-        NUM_GROUPS=NUM_GROUPS,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_SIZE=block_size,
-        num_warps=8,
-    )
-    return o
-
-
-def triton_flash_attn_varlen_paged_int8(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    block_tables: torch.Tensor,
-    scale: float,
-) -> torch.Tensor:
-    """INT8 counterpart of `triton_flash_attn_varlen_paged` (prefix-cache hit,
-    kv_quant=True). Same interface as the BF16 wrapper plus the INT8 scales.
-
-    k_cache/v_cache: (num_blocks, block_size, num_kv_heads, head_dim) INT8
-    k_scale/v_scale: (num_blocks, block_size, num_kv_heads, NUM_GROUPS) FP32
-    """
-    total_q, num_heads, head_dim = q.shape
-    num_blocks, block_size, num_kv_heads, _ = k_cache.shape
-    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
-    assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1, "head_dim must be contiguous"
-    assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
-    assert head_dim % NUM_GROUPS == 0
-    assert block_size % 64 == 0, "block_size must be a multiple of BLOCK_N=64 (single tile per block)"
-
-    o = torch.empty_like(q)
-    num_seqs = cu_seqlens_q.numel() - 1
-    BLOCK_M = 128
-    BLOCK_N = 64
-    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_heads, num_seqs)
-
-    _fwd_kernel[grid](
-        q, k_cache, v_cache, o,
-        cu_seqlens_q, cu_seqlens_k,
-        block_tables,
+        bt,
         k_scale, v_scale,
         q.stride(0), q.stride(1),
-        k_cache.stride(1), k_cache.stride(2), k_cache.stride(0),   # stride_kt, stride_kh, stride_kb
-        v_cache.stride(1), v_cache.stride(2), v_cache.stride(0),
-        k_scale.stride(0), k_scale.stride(1),                      # stride_ksc_b, stride_ksc_t
-        v_scale.stride(0), v_scale.stride(1),
+        stride_kt, stride_kh, stride_kb,
+        stride_vt, stride_vh, stride_vb,
+        ksc_b, ksc_t, vsc_b, vsc_t,
         o.stride(0), o.stride(1),
-        block_tables.stride(0),
+        bt_stride,
         scale,
-        IS_PAGED=True,
-        IS_INT8=True,
+        IS_PAGED=IS_PAGED,
+        IS_INT8=IS_INT8,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
@@ -602,17 +512,32 @@ def triton_paged_attention(
     scale: float,
     num_splits: int | None = None,   # flash-decoding splits; None = auto (by batch size)
     mid: torch.Tensor | None = None, # pre-allocated split buffer (CUDA-graph friendly)
+    k_scale: torch.Tensor | None = None,  # INT8 group scales (kv_quant=True)
+    v_scale: torch.Tensor | None = None,  # same layout as k_scale
 ) -> torch.Tensor:
-    """Single-query paged attention over the paged BF16 KV cache (decode path).
+    """Unified single-query paged attention over the paged KV cache (decode).
 
-    A drop-in alternative to `flash_attn_with_kvcache` for the BF16 decode
-    case. Returns a tensor shaped like q.
+    BF16 by default; pass k_scale/v_scale for the fused INT8 path (reads the
+    INT8 cache once and dequantizes in-register — no whole-cache BF16 buffer).
+    A drop-in alternative to `flash_attn_with_kvcache` for both dtypes.
+    Returns a tensor shaped like q.
     """
+    IS_INT8 = k_scale is not None
+    assert (k_scale is None) == (v_scale is None), "k_scale and v_scale must be passed together"
+
     num_seqs, num_heads, head_dim = q.shape
     num_blocks, block_size, num_kv_heads, _ = k_cache.shape
     assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
     assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
     assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1
+
+    if IS_INT8:
+        assert head_dim % NUM_GROUPS == 0
+        ksc_b, ksc_t = k_scale.stride(0), k_scale.stride(1)
+        vsc_b, vsc_t = v_scale.stride(0), v_scale.stride(1)
+    else:
+        k_scale = v_scale = k_cache         # dummy (IS_INT8=False never dereferences)
+        ksc_b = ksc_t = vsc_b = vsc_t = 0
 
     BLOCK_N = 64    # divides block_size (256), so one tile never spans two cache blocks
     assert block_size % BLOCK_N == 0
@@ -623,17 +548,17 @@ def triton_paged_attention(
     if num_splits == 1:
         # Large batches already saturate the GPU: single-pass, direct output.
         _paged_attn_decode_kernel[(num_seqs, num_heads, 1)](
-            q, k_cache, v_cache, k_cache, k_cache, o, o,   # scale ptrs & mid unused (IS_INT8=False, WRITE_MID=False)
+            q, k_cache, v_cache, k_scale, v_scale, o, o,   # mid unused (WRITE_MID=False)
             block_tables, context_lens,
             scale,
             q.stride(0), q.stride(1),
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-            0, 0, 0, 0,                                     # scale strides unused
+            ksc_b, ksc_t, vsc_b, vsc_t,
             o.stride(0), o.stride(1),
             0, 0,                                           # mid strides unused
             block_tables.stride(0),
-            IS_INT8=False,
+            IS_INT8=IS_INT8,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             HEAD_DIM=head_dim,
@@ -652,112 +577,17 @@ def triton_paged_attention(
     # so an empty buffer is safe; `mid` may be a shared pre-allocated buffer.
     mid = _get_mid(mid, num_seqs, num_heads, num_splits, head_dim, q.device)
     _paged_attn_decode_kernel[(num_seqs, num_heads, num_splits)](
-        q, k_cache, v_cache, k_cache, k_cache, o, mid,
-        block_tables, context_lens,
-        scale,
-        q.stride(0), q.stride(1),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        0, 0, 0, 0,                                     # scale strides unused
-        o.stride(0), o.stride(1),
-        mid.stride(0), mid.stride(1),
-        block_tables.stride(0),
-        IS_INT8=False,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        HEAD_DIM=head_dim,
-        GROUP_SIZE=head_dim // NUM_GROUPS,
-        NUM_GROUPS=NUM_GROUPS,
-        BLOCK_SIZE=block_size,
-        BLOCK_N=BLOCK_N,
-        NUM_SPLITS=num_splits,
-        WRITE_MID=True,
-        num_warps=4,
-    )
-    _split_reduce_kernel[(num_seqs, num_heads)](
-        mid, o,
-        mid.stride(0), mid.stride(1),
-        o.stride(0), o.stride(1),
-        num_heads=num_heads,
-        NUM_SPLITS=num_splits,
-        HEAD_DIM=head_dim,
-    )
-    return o
-
-
-def triton_paged_attention_int8(
-    q: torch.Tensor,             # (num_seqs, num_heads, head_dim) BF16
-    k_cache: torch.Tensor,       # (num_blocks, block_size, num_kv_heads, head_dim) INT8
-    v_cache: torch.Tensor,       # same layout as k_cache, INT8
-    k_scale: torch.Tensor,       # (blocks, block_size, kv_heads, NUM_GROUPS) FP32
-    v_scale: torch.Tensor,       # same layout as k_scale
-    block_tables: torch.Tensor,  # (num_seqs, max_num_blocks) int32
-    context_lens: torch.Tensor,  # (num_seqs,) int32
-    scale: float,
-    num_splits: int | None = None,   # flash-decoding splits; None = auto (by batch size)
-    mid: torch.Tensor | None = None, # pre-allocated split buffer (CUDA-graph friendly)
-) -> torch.Tensor:
-    """Single-query paged attention over the paged INT8 KV cache (decode path).
-
-    A fused alternative to `dequant_kvcache + flash_attn_with_kvcache`:
-    reads INT8 once and dequantizes in-register instead of materializing a
-    whole-cache BF16 buffer every decode step. Returns a tensor shaped like q.
-    """
-    num_seqs, num_heads, head_dim = q.shape
-    num_blocks, block_size, num_kv_heads, _ = k_cache.shape
-    assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
-    assert head_dim & (head_dim - 1) == 0, "head_dim must be a power of 2 (tl.arange requirement)"
-    assert q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1
-    assert head_dim % NUM_GROUPS == 0
-
-    BLOCK_N = 64    # divides block_size (256), so one tile never spans two cache blocks
-    assert block_size % BLOCK_N == 0
-    if num_splits is None:
-        num_splits = _num_splits_for(num_seqs, num_heads)
-
-    o = torch.empty_like(q)
-    if num_splits == 1:
-        _paged_attn_decode_kernel[(num_seqs, num_heads, 1)](
-            q, k_cache, v_cache, k_scale, v_scale, o, o,   # mid_ptr unused
-            block_tables, context_lens,
-            scale,
-            q.stride(0), q.stride(1),
-            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-            k_scale.stride(0), k_scale.stride(1),
-            v_scale.stride(0), v_scale.stride(1),
-            o.stride(0), o.stride(1),
-            0, 0,                                         # mid strides unused
-            block_tables.stride(0),
-            IS_INT8=True,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            HEAD_DIM=head_dim,
-            GROUP_SIZE=head_dim // NUM_GROUPS,
-            NUM_GROUPS=NUM_GROUPS,
-            BLOCK_SIZE=block_size,
-            BLOCK_N=BLOCK_N,
-            NUM_SPLITS=1,
-            WRITE_MID=False,
-            num_warps=4,
-        )
-        return o
-
-    # See the BF16 wrapper: every split slot is written unconditionally.
-    mid = _get_mid(mid, num_seqs, num_heads, num_splits, head_dim, q.device)
-    _paged_attn_decode_kernel[(num_seqs, num_heads, num_splits)](
         q, k_cache, v_cache, k_scale, v_scale, o, mid,
         block_tables, context_lens,
         scale,
         q.stride(0), q.stride(1),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        k_scale.stride(0), k_scale.stride(1),
-        v_scale.stride(0), v_scale.stride(1),
+        ksc_b, ksc_t, vsc_b, vsc_t,
         o.stride(0), o.stride(1),
         mid.stride(0), mid.stride(1),
         block_tables.stride(0),
-        IS_INT8=True,
+        IS_INT8=IS_INT8,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         HEAD_DIM=head_dim,
@@ -778,3 +608,6 @@ def triton_paged_attention_int8(
         HEAD_DIM=head_dim,
     )
     return o
+
+
+

@@ -19,7 +19,7 @@ import torch
 from flash_attn import flash_attn_with_kvcache
 
 from nanovllm.layers.triton_attn import (
-    triton_paged_attention, triton_paged_attention_int8, _num_splits_for,
+    triton_paged_attention, _num_splits_for,
 )
 from nanovllm.layers.kv_quant import dequant_kvcache
 
@@ -129,7 +129,8 @@ def bench_int8(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
         return triton_paged_attention(q, k_cache, v_cache, block_tables, context_lens, scale)
 
     def tri_int8():
-        return triton_paged_attention_int8(q, k_i8, v_i8, k_sc, v_sc, block_tables, context_lens, scale)
+        return triton_paged_attention(q, k_i8, v_i8, block_tables, context_lens, scale,
+                                      k_scale=k_sc, v_scale=v_sc)
 
     t_dequant = _median_ms(dequant_flash)
     t_flash = _median_ms(flash_bf16)
