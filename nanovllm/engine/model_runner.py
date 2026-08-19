@@ -664,8 +664,13 @@ class ModelRunner:
         """Build a single varlen batch mixing prefill chunks and decode tokens.
 
         Decode tokens are treated as length-1 prefill sequences. All K/V is
-        read from paged cache via block_table, so flash_attn_varlen_func
-        handles both types uniformly.
+        read from the paged cache via block_table, so the paged prefill kernel
+        (`triton_flash_attn_varlen` when use_triton_attn, else the
+        flash_attn_varlen_func fallback) handles both types uniformly.
+
+        NOTE: run_chunked no longer feeds decode tokens through here — it
+        splits them out to prepare_decode (dedicated single-query kernel).
+        The decode branch below is kept for completeness / defense.
         """
         input_ids = []
         positions = []
@@ -718,9 +723,33 @@ class ModelRunner:
         return input_ids, positions
 
     def run_chunked(self, seqs: list[Sequence], seqlen_this_time: dict[int, int]) -> list[int]:
-        input_ids, positions = self.prepare_chunked(seqs, seqlen_this_time)
-        logits = self.run_model(input_ids, positions, is_prefill=True)
+        # Split the mixed batch: prefill chunks use the paged prefill kernel,
+        # decode tokens use the dedicated single-query kernel. Feeding decode
+        # tokens through prepare_chunked would route them through the prefill
+        # kernel's BLOCK_M=128 tl.dot with only one valid row — correct but
+        # wasteful. Sampling happens once, over logits reassembled in the
+        # original `seqs` order.
+        prefill_pos = [i for i, s in enumerate(seqs) if s.is_prefill]
+        decode_pos = [i for i, s in enumerate(seqs) if not s.is_prefill]
+
+        logits_list = [None] * len(seqs)
+
+        if prefill_pos:
+            prefill_seqs = [seqs[i] for i in prefill_pos]
+            input_ids, positions = self.prepare_chunked(prefill_seqs, seqlen_this_time)
+            prefill_logits = self.run_model(input_ids, positions, is_prefill=True)
+            for j, i in enumerate(prefill_pos):
+                logits_list[i] = prefill_logits[j]
+
+        if decode_pos:
+            decode_seqs = [seqs[i] for i in decode_pos]
+            input_ids, positions = self.prepare_decode(decode_seqs)
+            decode_logits = self.run_model(input_ids, positions, is_prefill=False)
+            for j, i in enumerate(decode_pos):
+                logits_list[i] = decode_logits[j]
+
         if self.rank == 0:
+            logits = torch.stack(logits_list)
             if all(seq.temperature <= 0 for seq in seqs):
                 token_ids = logits.argmax(dim=-1).tolist()
             else:
