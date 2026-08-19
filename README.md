@@ -10,9 +10,10 @@ This repository is a secondary-development fork of [GeeeekExplorer/nano-vllm](ht
 4. **Top-k / Top-p sampling**: extends `SamplingParams` with `top_k` and `top_p` (disabled by default) to filter low-probability candidates before sampling. The default path is unchanged; when filtering is requested, candidates are pruned by top-k then top-p before the existing exponential-race sampling.
 5. **Multi-model support**: a dispatch table in `model_runner.py` selects the model class by `hf_config.model_type`. Adding a new architecture is a matter of dropping a `models/xxx.py` and registering one line.
 6. **Chunked prefill**: an `enable_chunked_prefill` flag in `Config` splits long prompts into chunks that interleave with decode in the same step. Pure-decode steps automatically fall back to CUDA Graph, so TPOT stays unchanged while TTFT drops 32×. Run `python bench_chunked.py` to compare ON vs OFF.
-7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head, group) symmetric Min-Max scaling — head_dim is split into 8 groups of 16 dims, each with its own dynamic scale, so outlier dimensions no longer crush the precision of the other dims. Combined with the self-researched Triton fused-dequant kernel (item 9), decode reads the INT8 cache directly (no whole-cache dequant pass), so memory *and* throughput both improve. Teacher-forced eval verifies it is near-lossless (continuation ΔPPL **+0.000**) — see the Triton Attention Kernels section.
-8. **Speculative decoding (EAGLE3)**: a chain-style EAGLE3 draft head (single Transformer decoder layer conditioned on low/mid/high target-layer features) proposes K candidate tokens that a standard rejection sampler verifies against the target in one pass. Supports greedy and temperature/top-k/top-p sampling; greedy output is token-for-token identical to non-spec decoding. Run `python bench_spec_decode.py`; see the [Speculative Decoding](#speculative-decoding-eagle3) section for numbers.
-9. **Self-researched Triton attention kernels**: FlashAttention-2 prefill (causal + GQA + varlen), paged-attention decode, a fused INT8 dequant decode kernel, and Flash-Decoding (split-K). Gated behind a `use_triton_attn` flag (default off, `flash_attn` package untouched). See the [Triton Attention Kernels](#triton-attention-kernels) section for benchmarks.
+7. **INT8 KV cache quantization**: a `kv_quant` flag quantizes KV cache to INT8 with per-(token, head, group) symmetric Min-Max scaling — head_dim is split into 8 groups of 16 dims, each with its own dynamic scale, so outlier dimensions no longer crush the precision of the other dims. Combined with the self-researched Triton fused-dequant kernel (item 10), decode reads the INT8 cache directly (no whole-cache dequant pass), so memory *and* throughput both improve. Teacher-forced eval verifies it is near-lossless (continuation ΔPPL **+0.000**) — see the Triton Attention Kernels section.
+8. **Online INT8 W8A16 weight-only PTQ**: set `weight_quant="int8_w8a16"` to quantize Transformer Linear weights while loading a BF16/FP16 checkpoint. Weights use symmetric per-output-channel INT8 + FP32 scale; activations remain BF16/FP16. A Triton GEMM reads INT8 weights directly and applies the scale after FP32 accumulation, with no dequantized weight workspace. Embeddings, norms, and LM head remain full precision in this first path.
+9. **Speculative decoding (EAGLE3)**: a chain-style EAGLE3 draft head (single Transformer decoder layer conditioned on low/mid/high target-layer features) proposes K candidate tokens that a standard rejection sampler verifies against the target in one pass. Supports greedy and temperature/top-k/top-p sampling; greedy output is token-for-token identical to non-spec decoding. Run `python bench_spec_decode.py`; see the [Speculative Decoding](#speculative-decoding-eagle3) section for numbers.
+10. **Self-researched Triton attention kernels**: FlashAttention-2 prefill (causal + GQA + varlen), paged-attention decode, a fused INT8 dequant decode kernel, and Flash-Decoding (split-K). Gated behind a `use_triton_attn` flag (default off, `flash_attn` package untouched). See the [Triton Attention Kernels](#triton-attention-kernels) section for benchmarks.
 
 ## Supported Models
 
@@ -215,6 +216,19 @@ The 32× TTFT reduction comes from interleaving: the first request only needs to
 | INT8 (`kv_quant=True`) | **18.4 MB (-37%)** | **663 (+60%)** | **~1.6×** |
 
 INT8 cuts per-block memory to ~63% of BF16, fitting ~1.6× the blocks (and therefore ~1.6× the max context or concurrent sequences) into the same GPU budget. The ratio is 1.6× rather than 2× because the group-wise scales add overhead: each (token, head) costs 128 B (INT8 data) + 32 B (8 × FP32 scales) = 160 B vs 256 B for BF16. With the fused Triton dequant kernel, this no longer costs throughput — see below.
+
+#### Online INT8 W8A16 Linear quantization (`bench_w8a16.py`)
+
+Use a normal BF16/FP16 checkpoint; quantization occurs once while the checkpoint is loaded:
+
+```python
+llm = LLM(
+    "/root/model/Llama-3.2-3B-Instruct",
+    weight_quant="int8_w8a16",
+)
+```
+
+The first path quantizes Transformer QKV/O/MLP Linear layers with symmetric per-output-channel scales, while embeddings, norms, and LM head remain BF16. `weight_quant=None` (the default) keeps the original path. Run `python bench_w8a16.py --model /root/model/Llama-3.2-3B-Instruct` for isolated BF16-vs-W8A16 weight-memory and end-to-end throughput numbers; run `python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct` for greedy accuracy. W8A16 initially uses the eager path while CUDA-Graph pre-warming for all Linear shapes is kept as a follow-up.
 
 #### CUDA Graph (`serving_bench.py` + `bench_prefill_graph.py`)
 

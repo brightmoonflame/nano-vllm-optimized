@@ -16,6 +16,9 @@ class Config:
     prefill_chunk_size: int = 1024
     enable_prefill_cudagraph: bool = False
     kv_quant: bool = False
+    # None keeps the original BF16 Linear layers.  "int8_w8a16" quantizes
+    # Linear weights at checkpoint-load time while activations stay BF16/FP16.
+    weight_quant: str | None = None
     use_triton_attn: bool = False   # False=走 flash_attn 包(默认); True=走自研 Triton 内核
     speculative_config: dict | None = None
     hf_config: AutoConfig | None = None
@@ -27,6 +30,7 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.weight_quant in (None, "int8_w8a16"), "supported weight_quant values: None, int8_w8a16"
         if self.speculative_config is not None:
             # The EAGLE3 draft only lives on rank 0 (shares the target's
             # embedding, which would need TP collectives otherwise) — see
