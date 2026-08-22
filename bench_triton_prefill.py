@@ -94,8 +94,10 @@ def _make_paged_inputs(prefix_len, new_len, num_heads, num_kv_heads, num_seqs=2,
     block_tables = torch.randperm(num_blocks, dtype=torch.int32, device=DEVICE).view(num_seqs, blocks_per_seq)
     q_lens = torch.full((num_seqs,), new_len, dtype=torch.int32)
     k_lens = torch.full((num_seqs,), context_len, dtype=torch.int32)
-    cu_q = torch.cat([torch.zeros(1, dtype=torch.int32), q_lens.cumsum(0)]).to(DEVICE)
-    cu_k = torch.cat([torch.zeros(1, dtype=torch.int32), k_lens.cumsum(0)]).to(DEVICE)
+    cu_q = torch.cat([torch.zeros(1, dtype=torch.int32), q_lens.cumsum(0)]).to(
+        device=DEVICE, dtype=torch.int32)
+    cu_k = torch.cat([torch.zeros(1, dtype=torch.int32), k_lens.cumsum(0)]).to(
+        device=DEVICE, dtype=torch.int32)
     q = torch.randn(num_seqs * new_len, num_heads, head_dim, dtype=dtype, device=DEVICE)
     k_cache = torch.randn(num_blocks, BLOCK_SIZE, num_kv_heads, head_dim, dtype=dtype, device=DEVICE)
     v_cache = torch.randn(num_blocks, BLOCK_SIZE, num_kv_heads, head_dim, dtype=dtype, device=DEVICE)
