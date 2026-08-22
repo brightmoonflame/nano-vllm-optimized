@@ -438,23 +438,18 @@ def _paged_attn_decode_kernel(
                  + offs_in_block[:, None] * stride_vt + kv_head_idx * stride_vh + offs_d[None, :])
 
         if IS_INT8:
-            # INT8 -> group-scale dequantization in registers. Keep the
-            # dequantized tile in BF16 so the following tl.dot can use the
-            # same matrix-multiply path as the Prefill kernel.
+            # INT8 -> group-scale dequant -> fp32, then element-wise q·k. A
+            # decode query is 1×HEAD_DIM, below tl.dot's minimum M=16 tile.
             k_i8 = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
             ks = tl.load(k_scale_ptr + physical_block.to(tl.int64) * stride_ksc_b
                          + offs_in_block[:, None] * stride_ksc_t + kv_head_idx * NUM_GROUPS + offs_g[None, :],
                          mask=mask_n[:, None], other=0.0)               # (BLOCK_N, NUM_GROUPS)
             ks_full = tl.reshape(tl.broadcast_to(ks[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
                                  (BLOCK_N, HEAD_DIM))
-            k = (k_i8.to(tl.float32) * ks_full).to(q_ptr.dtype.element_ty)
+            qk = tl.sum(q[None, :].to(tl.float32) * k_i8.to(tl.float32) * ks_full, axis=1) * scale
         else:
             k = tl.load(k_cache_ptr + k_off, mask=mask_n[:, None], other=0.0)
-
-        # A (1, HEAD_DIM) × (HEAD_DIM, BLOCK_N) tile is small but maps to the
-        # same tensor-core-friendly dot primitive used by Prefill. The former
-        # element-wise FP32 reduction compiled to scalar FMA instructions.
-        qk = tl.reshape(tl.dot(q[None, :], tl.trans(k)), (BLOCK_N,)) * scale
+            qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1) * scale
 
         qk = tl.where(mask_n, qk, float("-inf"))
 
@@ -470,14 +465,10 @@ def _paged_attn_decode_kernel(
                          mask=mask_n[:, None], other=0.0)
             vs_full = tl.reshape(tl.broadcast_to(vs[:, :, None], (BLOCK_N, NUM_GROUPS, GROUP_SIZE)),
                                  (BLOCK_N, HEAD_DIM))
-            v = (v_i8.to(tl.float32) * vs_full).to(q_ptr.dtype.element_ty)
+            acc = acc * alpha + tl.sum(p[:, None] * v_i8.to(tl.float32) * vs_full, axis=0)
         else:
             v = tl.load(v_cache_ptr + v_off, mask=mask_n[:, None], other=0.0)
-
-        # Match Prefill's PV accumulation as well; p is cast to BF16 for the
-        # tensor-core input while tl.dot still accumulates into FP32.
-        pv = tl.reshape(tl.dot(p[None, :].to(v.dtype), v), (HEAD_DIM,))
-        acc = acc * alpha + pv
+            acc = acc * alpha + tl.sum(p[:, None] * v.to(tl.float32), axis=0)
 
         l_i = l_i * alpha + tl.sum(p[None, :], axis=1)          # (1,)
         m_i = m_new
@@ -617,5 +608,4 @@ def triton_paged_attention(
         HEAD_DIM=head_dim,
     )
     return o
-
 
