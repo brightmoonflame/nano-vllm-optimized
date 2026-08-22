@@ -57,9 +57,10 @@ PROMPTS = [
 ]
 
 
-def free_run(model: str, prompts: list[str], max_tokens: int) -> list[list[int]]:
+def free_run(model: str, prompts: list[str], max_tokens: int,
+             use_triton_attn: bool) -> list[list[int]]:
     """BF16 greedy generation — produces the reference continuations."""
-    llm = LLM(model, kv_quant=False, use_triton_attn=True, enforce_eager=True)
+    llm = LLM(model, kv_quant=False, use_triton_attn=use_triton_attn, enforce_eager=True)
     sp = SamplingParams(temperature=0, max_tokens=max_tokens)
     outs = llm.generate(prompts, sp, use_tqdm=False)
     llm.exit()
@@ -69,7 +70,8 @@ def free_run(model: str, prompts: list[str], max_tokens: int) -> list[list[int]]
     return [o["token_ids"] for o in outs]
 
 
-def teacher_forced_eval(model: str, kv_quant: bool, prompts: list[str], continuations: list[list[int]]):
+def teacher_forced_eval(model: str, kv_quant: bool, prompts: list[str], continuations: list[list[int]],
+                         use_triton_attn: bool):
     """Teacher-force one model along each reference continuation.
 
     Returns (preds, sum_logprob, count):
@@ -83,7 +85,7 @@ def teacher_forced_eval(model: str, kv_quant: bool, prompts: list[str], continua
     instead of `Scheduler.postprocess`, because postprocess would append the
     *sampled* token — teacher forcing needs the *reference* token appended.
     """
-    llm = LLM(model, kv_quant=kv_quant, use_triton_attn=True, enforce_eager=True)
+    llm = LLM(model, kv_quant=kv_quant, use_triton_attn=use_triton_attn, enforce_eager=True)
     engine, runner, sched = llm, llm.model_runner, llm.scheduler
 
     all_preds, total_lp, total_n = [], 0.0, 0
@@ -139,15 +141,17 @@ def main():
     p = argparse.ArgumentParser(description="Teacher-forced INT8 vs BF16 accuracy.")
     p.add_argument("--model", required=True)
     p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--use-triton-attn", action=argparse.BooleanOptionalAction, default=True,
+                   help="use Triton attention (default: true); pass --no-use-triton-attn for flash-attn fallback")
     args = p.parse_args()
     model = str(Path(args.model).expanduser().resolve())
 
     print(">> free-run (BF16 greedy) to build reference continuations ...")
-    refs = free_run(model, PROMPTS, args.max_tokens)
+    refs = free_run(model, PROMPTS, args.max_tokens, args.use_triton_attn)
     print(">> teacher-forced eval: BF16 ...")
-    bf16_preds, bf16_lp, n = teacher_forced_eval(model, False, PROMPTS, refs)
+    bf16_preds, bf16_lp, n = teacher_forced_eval(model, False, PROMPTS, refs, args.use_triton_attn)
     print(">> teacher-forced eval: INT8 ...")
-    int8_preds, int8_lp, _ = teacher_forced_eval(model, True, PROMPTS, refs)
+    int8_preds, int8_lp, _ = teacher_forced_eval(model, True, PROMPTS, refs, args.use_triton_attn)
 
     agree = sum(x == y for a, b in zip(bf16_preds, int8_preds) for x, y in zip(a, b))
     # Sanity: BF16 teacher-forced along its own greedy output should reproduce
@@ -158,7 +162,8 @@ def main():
     int8_ppl = math.exp(-int8_lp / n)
 
     print("=" * 60)
-    print(f"device: {torch.cuda.get_device_name(0)}   prompts={len(PROMPTS)}  cont tokens={n}")
+    backend = "Triton" if args.use_triton_attn else "flash-attn fallback"
+    print(f"device: {torch.cuda.get_device_name(0)}   backend={backend}  prompts={len(PROMPTS)}  cont tokens={n}")
     print("=" * 60)
     print(f"[sanity] BF16 vs its own reference:  {self_check}/{n} ({100 * self_check / n:.2f}%)")
     print(f"teacher-forced agreement INT8 vs BF16: {agree}/{n} ({100 * agree / n:.2f}%)")

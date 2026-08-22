@@ -1,4 +1,4 @@
-"""Stage 1 precision check: triton_flash_attn_varlen vs flash_attn_varlen_func.
+"""Precision checks for the Triton attention kernels against flash-attn.
 
 Requires a CUDA GPU + flash-attn installed. Run directly:
     python -u tests/test_triton_attn.py

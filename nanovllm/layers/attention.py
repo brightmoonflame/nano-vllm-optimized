@@ -77,55 +77,55 @@ class Attention(nn.Module):
                 store_kvcache_int8(k, v, k_cache, v_cache, self.k_scale, self.v_scale, context.slot_mapping)
             else:
                 store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+        # Decode always reads the paged cache. Prefill only does so for a
+        # prefix-cache hit or a mixed Chunked Prefill batch.
+        use_triton = self.use_triton_attn and self.sliding_window is None
+        is_paged = not context.is_prefill or context.block_tables is not None
+        if not context.is_prefill:
+            assert context.block_tables is not None, "decode requires paged KV block tables"
+
+        # Dense Prefill attends to the newly projected BF16 K/V directly.
+        # Paged Prefill and Decode instead read K/V through the block table.
+        k_attn, v_attn = (k_cache, v_cache) if is_paged else (k, v)
+        if self.kv_quant and is_paged and not use_triton:
+            # flash-attn does not accept the group-wise scales, so its INT8
+            # compatibility path materializes a BF16 paged cache first.
+            k_attn = dequant_kvcache(k_cache, self.k_scale)
+            v_attn = dequant_kvcache(v_cache, self.v_scale)
+
         # window_size: (left, right). sliding_window sets left bound; None means global.
         window_size = (self.sliding_window, 0) if self.sliding_window else (-1, -1)
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            # Triton FA2 covers dense prefill and paged prefill (prefix-cache
-            # hit) for both BF16 and INT8 caches. Only sliding window still
-            # falls back to flash_attn.
-            use_triton = self.use_triton_attn and self.sliding_window is None
             if use_triton:
-                if context.block_tables is None:
-                    o = triton_flash_attn_varlen(q, k, v, context.cu_seqlens_q,
+                if not is_paged:
+                    o = triton_flash_attn_varlen(q, k_attn, v_attn, context.cu_seqlens_q,
                                                  max_seqlen_q=context.max_seqlen_q, scale=self.scale)
                 else:
                     o = triton_flash_attn_varlen(
-                        q, k, v, context.cu_seqlens_q,
+                        q, k_attn, v_attn, context.cu_seqlens_q,
                         max_seqlen_q=context.max_seqlen_q, scale=self.scale,
                         cu_seqlens_k=context.cu_seqlens_k, block_tables=context.block_tables,
                         k_scale=self.k_scale if self.kv_quant else None,
                         v_scale=self.v_scale if self.kv_quant else None)
             else:
-                o = flash_attn_varlen_func(q, k, v,
+                o = flash_attn_varlen_func(q, k_attn, v_attn,
                                            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                            softmax_scale=self.scale, causal=True, block_table=context.block_tables,
                                            window_size=window_size)
         else:    # decode
-            if self.kv_quant:
-                if self.use_triton_attn and self.sliding_window is None:
-                    # Stage 3: fused INT8 dequant — cache read once as int8,
-                    # dequantized in-register, no whole-cache BF16 buffer.
-                    o = triton_paged_attention(
-                        q, k_cache, v_cache,
-                        context.block_tables, context.context_lens, self.scale,
-                        mid=self.mid_buffer, k_scale=self.k_scale, v_scale=self.v_scale)
-                else:
-                    # Default: whole-cache dequant + flash_attn (fallback baseline).
-                    k_bf16 = dequant_kvcache(k_cache, self.k_scale)
-                    v_bf16 = dequant_kvcache(v_cache, self.v_scale)
-                    o = flash_attn_with_kvcache(q.unsqueeze(1), k_bf16, v_bf16,
-                                                cache_seqlens=context.context_lens, block_table=context.block_tables,
-                                                softmax_scale=self.scale, causal=True, window_size=window_size)
-            elif self.use_triton_attn and self.sliding_window is None:
-                # Triton paged attention (stage 2): single query over paged KV cache, BF16.
-                o = triton_paged_attention(q, k_cache, v_cache,
-                                           context.block_tables, context.context_lens, self.scale,
-                                           mid=self.mid_buffer)
+            if use_triton:
+                # Reads BF16 or INT8 paged K/V directly. The INT8 variant
+                # applies its group-wise scales in-register during attention.
+                o = triton_paged_attention(
+                    q, k_attn, v_attn,
+                    context.block_tables, context.context_lens, self.scale,
+                    mid=self.mid_buffer,
+                    k_scale=self.k_scale if self.kv_quant else None,
+                    v_scale=self.v_scale if self.kv_quant else None)
             else:
-                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_attn, v_attn,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True, window_size=window_size)
         return o

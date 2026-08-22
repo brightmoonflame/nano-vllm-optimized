@@ -1,7 +1,7 @@
 """INT8 vs BF16 generation accuracy: greedy token-match rate.
 
-Runs the same prompts through kv_quant=True and kv_quant=False (both on the
-self-researched Triton kernels) and reports how faithfully the INT8 path
+Runs the same prompts through kv_quant=True and kv_quant=False using the
+selected attention backend, then reports how faithfully the INT8 path
 reproduces the BF16 greedy output — the "does quantization change the answer"
 number.
 
@@ -36,8 +36,9 @@ PROMPTS = [
 ]
 
 
-def generate(model: str, kv_quant: bool, prompts: list[str], max_tokens: int) -> list[list[int]]:
-    llm = LLM(model, kv_quant=kv_quant, use_triton_attn=True, enforce_eager=True)
+def generate(model: str, kv_quant: bool, prompts: list[str], max_tokens: int,
+             use_triton_attn: bool) -> list[list[int]]:
+    llm = LLM(model, kv_quant=kv_quant, use_triton_attn=use_triton_attn, enforce_eager=True)
     sp = SamplingParams(temperature=0, max_tokens=max_tokens)   # greedy → deterministic
     outs = llm.generate(prompts, sp, use_tqdm=False)
     llm.exit()
@@ -51,11 +52,15 @@ def main():
     p = argparse.ArgumentParser(description="INT8 vs BF16 greedy generation accuracy.")
     p.add_argument("--model", required=True)
     p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--use-triton-attn", action=argparse.BooleanOptionalAction, default=True,
+                   help="use Triton attention (default: true); pass --no-use-triton-attn for flash-attn fallback")
     args = p.parse_args()
     model = str(Path(args.model).expanduser().resolve())
 
-    bf16 = generate(model, kv_quant=False, prompts=PROMPTS, max_tokens=args.max_tokens)
-    int8 = generate(model, kv_quant=True, prompts=PROMPTS, max_tokens=args.max_tokens)
+    bf16 = generate(model, kv_quant=False, prompts=PROMPTS, max_tokens=args.max_tokens,
+                    use_triton_attn=args.use_triton_attn)
+    int8 = generate(model, kv_quant=True, prompts=PROMPTS, max_tokens=args.max_tokens,
+                    use_triton_attn=args.use_triton_attn)
 
     exact = 0
     matched = 0
@@ -82,7 +87,8 @@ def main():
     avg_first_div = sum(first_div) / len(first_div)
 
     print("=" * 56)
-    print(f"device: {torch.cuda.get_device_name(0)}   prompts={len(PROMPTS)}  max_tokens={args.max_tokens}")
+    backend = "Triton" if args.use_triton_attn else "flash-attn fallback"
+    print(f"device: {torch.cuda.get_device_name(0)}   backend={backend}  prompts={len(PROMPTS)}  max_tokens={args.max_tokens}")
     print("=" * 56)
     print(f"exact-match rate:        {exact}/{len(PROMPTS)} ({100 * exact / len(PROMPTS):.1f}%)")
     print(f"token-match rate:        {matched}/{total} ({100 * matched / total:.2f}%)  (raw, cascade-sensitive)")
