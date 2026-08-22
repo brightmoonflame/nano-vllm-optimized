@@ -70,7 +70,8 @@ def bench(seqlen, num_heads, num_kv_heads, num_seqs=1):
         max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
         softmax_scale=scale, causal=True,
     )
-    tri = lambda: triton_flash_attn_varlen(q, k, v, cu, max_seqlen=max_seqlen, scale=scale)
+    tri = lambda: triton_flash_attn_varlen(
+        q, k, v, cu, max_seqlen_q=max_seqlen, scale=scale)
 
     t_ref = _median_ms(ref)
     t_tri = _median_ms(tri)
