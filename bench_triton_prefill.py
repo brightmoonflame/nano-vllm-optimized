@@ -8,6 +8,11 @@ dense BF16 Prefill plus paged BF16 / INT8 Prefix-or-Chunked Prefill. Run:
 For BF16, ratio = triton_time / flash_attn_time; a ratio > 1 means Triton is
 slower. INT8 additionally compares fused Triton against the compatible
 whole-cache dequant + flash-attn fallback.
+
+The dense sweep also includes a deliberately naive PyTorch causal-attention
+reference for sequence lengths up to 4096. It explicitly materializes the
+[heads, seqlen, seqlen] score matrix, so it is a teaching/reference baseline,
+not a production alternative to FlashAttention.
 """
 import statistics
 import time
@@ -49,6 +54,20 @@ def _median_ms(fn):
     return statistics.median(ts)
 
 
+def _naive_causal_attention(q_heads: torch.Tensor, k_heads: torch.Tensor, v_heads: torch.Tensor,
+                            scale: float, causal_mask: torch.Tensor) -> torch.Tensor:
+    """Textbook dense attention: QK^T -> causal mask -> softmax -> V.
+
+    Unlike FlashAttention, `scores` and `probs` are full [H, L, L] tensors.
+    Inputs are [H, L, D], with GQA K/V heads expanded before timing so this
+    measures QK^T, softmax, and PV rather than one-time layout preparation.
+    """
+    scores = torch.matmul(q_heads, k_heads.transpose(-2, -1)).mul_(scale)
+    scores.masked_fill_(causal_mask, float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    return torch.matmul(probs, v_heads)
+
+
 def _quantize_groupwise(bf16_cache: torch.Tensor):
     """Synthetic INT8 cache with the production per-group scale layout."""
     num_blocks, block_size, num_kv_heads, head_dim = bf16_cache.shape
@@ -62,7 +81,7 @@ def _quantize_groupwise(bf16_cache: torch.Tensor):
     return quantized, scales
 
 
-def bench(seqlen, num_heads, num_kv_heads, num_seqs=1):
+def bench(seqlen, num_heads, num_kv_heads, num_seqs=1, benchmark_naive=False):
     q, k, v, cu, max_seqlen, scale = _make_inputs(seqlen, num_heads, num_kv_heads, num_seqs=num_seqs)
 
     ref = lambda: flash_attn_varlen_func(
@@ -80,6 +99,18 @@ def bench(seqlen, num_heads, num_kv_heads, num_seqs=1):
     print(f"seqlen={seqlen:>5}  heads={num_heads:>2}/{num_kv_heads:<2}  "
           f"flash_attn={t_ref:7.3f}ms  triton={t_tri:7.3f}ms  "
           f"ratio={ratio:5.2f}x  (triton={pct:5.1f}% of flash_attn)")
+    if benchmark_naive:
+        # The mask is intentionally prepared outside the timed region: this
+        # measures the dense attention calculation, not one-time layout/mask setup.
+        causal_mask = torch.ones((seqlen, seqlen), dtype=torch.bool, device=DEVICE).triu_(1)
+        q_heads = q.transpose(0, 1).float()
+        k_heads = k.repeat_interleave(num_heads // num_kv_heads, dim=1).transpose(0, 1).float()
+        v_heads = v.repeat_interleave(num_heads // num_kv_heads, dim=1).transpose(0, 1).float()
+        naive = lambda: _naive_causal_attention(q_heads, k_heads, v_heads, scale, causal_mask)
+        t_naive = _median_ms(naive)
+        print(f"{'':>29}torch_naive={t_naive:7.3f}ms  "
+              f"triton vs naive={t_naive / t_tri:5.2f}x  "
+              f"flash vs naive={t_naive / t_ref:5.2f}x")
     return ratio
 
 
@@ -158,7 +189,9 @@ def main():
     print(f"device: {torch.cuda.get_device_name(0)}")
     # Llama-3.2-3B: 24 attention heads / 8 KV heads (GQA 3:1), head_dim 128.
     for seqlen in [512, 1024, 2048, 4096, 8192]:
-        bench(seqlen, num_heads=24, num_kv_heads=8)
+        # Naive attention's O(L^2) FP32 score/prob tensors become several GiB
+        # at 8192, so keep the teaching reference to bounded, useful shapes.
+        bench(seqlen, num_heads=24, num_kv_heads=8, benchmark_naive=seqlen <= 4096)
     print("--- paged prefill: prefix cache / chunked continuation (batch=2) ---")
     for total_len in [1024, 2048, 4096]:
         bench_paged(total_len // 2, total_len // 2, num_heads=24, num_kv_heads=8)
