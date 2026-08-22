@@ -21,15 +21,12 @@ from flash_attn import flash_attn_with_kvcache
 from nanovllm.layers.triton_attn import (
     triton_paged_attention, _num_splits_for,
 )
-from nanovllm.layers.kv_quant import dequant_kvcache
+from nanovllm.layers.kv_quant import NUM_GROUPS, dequant_kvcache
 
 DEVICE = "cuda"
 BLOCK_SIZE = 256
 WARMUP = 5
 REPEATS = 30
-
-
-NUM_GROUPS = 8
 
 
 def _quantize_groupwise(bf16_cache: torch.Tensor):
@@ -72,6 +69,16 @@ def _median_ms(fn):
     return statistics.median(ts)
 
 
+def _make_mid(num_seqs, num_heads, head_dim, num_splits):
+    """Pre-allocate the Flash-Decoding intermediate buffer when required."""
+    if num_splits == 1:
+        return None
+    return torch.empty(
+        num_seqs * num_heads * num_splits * (head_dim + 2),
+        dtype=torch.float32, device=DEVICE,
+    )
+
+
 def bench(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
     q, k_cache, v_cache, block_tables, context_lens, scale = _make_inputs(
         ctx_len, num_seqs, num_heads, num_kv_heads)
@@ -81,13 +88,15 @@ def bench(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
         cache_seqlens=context_lens, block_table=block_tables,
         softmax_scale=scale, causal=True,
     )
-    tri = lambda: triton_paged_attention(q, k_cache, v_cache, block_tables, context_lens, scale)
+    splits = _num_splits_for(num_seqs, num_heads)
+    mid = _make_mid(num_seqs, num_heads, q.size(-1), splits)
+    tri = lambda: triton_paged_attention(
+        q, k_cache, v_cache, block_tables, context_lens, scale, mid=mid)
 
     t_ref = _median_ms(ref)
     t_tri = _median_ms(tri)
     ratio = t_tri / t_ref
     pct = 100.0 / ratio
-    splits = _num_splits_for(num_seqs, num_heads)
     print(f"ctx={ctx_len:>5}  batch={num_seqs:>4}  "
           f"flash_attn={t_ref:7.3f}ms  triton={t_tri:7.3f}ms  "
           f"ratio={ratio:5.2f}x  (triton={pct:5.1f}% of flash_attn)  [splits={splits}]")
@@ -99,13 +108,15 @@ def bench_int8(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
       1. dequant(whole cache) + flash_attn — the default kv_quant=True path
          (dequantizes EVERY block every layer every step; reads ctx-independent)
       2. flash_attn BF16                   — the kv_quant=False ceiling
-      3. triton BF16                       — stage-2 kernel
-      4. triton INT8 fused                 — stage-3 kernel (this work)
+      3. triton BF16                       — custom paged-attention kernel
+      4. triton INT8 fused                 — in-register INT8 dequantization
     """
     q, k_cache, v_cache, block_tables, context_lens, scale = _make_inputs(
         ctx_len, num_seqs, num_heads, num_kv_heads)
     k_i8, k_sc = _quantize_groupwise(k_cache)
     v_i8, v_sc = _quantize_groupwise(v_cache)
+    splits = _num_splits_for(num_seqs, num_heads)
+    mid = _make_mid(num_seqs, num_heads, q.size(-1), splits)
 
     def dequant_flash():
         # Mirrors attention.py's default kv_quant branch: full-cache dequant
@@ -126,11 +137,13 @@ def bench_int8(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
         )
 
     def tri_bf16():
-        return triton_paged_attention(q, k_cache, v_cache, block_tables, context_lens, scale)
+        return triton_paged_attention(
+            q, k_cache, v_cache, block_tables, context_lens, scale, mid=mid)
 
     def tri_int8():
-        return triton_paged_attention(q, k_i8, v_i8, block_tables, context_lens, scale,
-                                      k_scale=k_sc, v_scale=v_sc)
+        return triton_paged_attention(
+            q, k_i8, v_i8, block_tables, context_lens, scale,
+            mid=mid, k_scale=k_sc, v_scale=v_sc)
 
     t_dequant = _median_ms(dequant_flash)
     t_flash = _median_ms(flash_bf16)
@@ -140,6 +153,38 @@ def bench_int8(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
           f"dequant+flash={t_dequant:7.3f}ms  flash_bf16={t_flash:7.3f}ms  "
           f"triton_bf16={t_tri:7.3f}ms  triton_int8={t_int8:7.3f}ms  "
           f"| int8 vs dequant: {t_dequant / t_int8:5.2f}x  int8 vs flash_bf16: {t_flash / t_int8:5.2f}x")
+
+
+def bench_flash_decoding(ctx_len, num_seqs, num_heads=24, num_kv_heads=8):
+    """Measure the benefit of split-K separately from the backend comparison."""
+    q, k_cache, v_cache, block_tables, context_lens, scale = _make_inputs(
+        ctx_len, num_seqs, num_heads, num_kv_heads)
+    k_i8, k_sc = _quantize_groupwise(k_cache)
+    v_i8, v_sc = _quantize_groupwise(v_cache)
+    auto_splits = _num_splits_for(num_seqs, num_heads)
+    mid = _make_mid(num_seqs, num_heads, q.size(-1), auto_splits)
+
+    bf16_single = lambda: triton_paged_attention(
+        q, k_cache, v_cache, block_tables, context_lens, scale, num_splits=1)
+    bf16_auto = lambda: triton_paged_attention(
+        q, k_cache, v_cache, block_tables, context_lens, scale,
+        num_splits=auto_splits, mid=mid)
+    int8_single = lambda: triton_paged_attention(
+        q, k_i8, v_i8, block_tables, context_lens, scale,
+        num_splits=1, k_scale=k_sc, v_scale=v_sc)
+    int8_auto = lambda: triton_paged_attention(
+        q, k_i8, v_i8, block_tables, context_lens, scale,
+        num_splits=auto_splits, mid=mid, k_scale=k_sc, v_scale=v_sc)
+
+    t_bf16_single = _median_ms(bf16_single)
+    t_bf16_auto = _median_ms(bf16_auto)
+    t_int8_single = _median_ms(int8_single)
+    t_int8_auto = _median_ms(int8_auto)
+    print(f"ctx={ctx_len:>5}  batch={num_seqs:>4}  auto_splits={auto_splits}  "
+          f"bf16 single/auto={t_bf16_single:7.3f}/{t_bf16_auto:7.3f}ms "
+          f"({t_bf16_single / t_bf16_auto:5.2f}x)  "
+          f"int8 single/auto={t_int8_single:7.3f}/{t_int8_auto:7.3f}ms "
+          f"({t_int8_single / t_int8_auto:5.2f}x)")
 
 
 def main():
@@ -153,6 +198,9 @@ def main():
     print("--- INT8 fused (batch=32) ---")
     for ctx_len in [1024, 2048, 4096, 8192]:
         bench_int8(ctx_len, num_seqs=32)
+    print("--- Flash-Decoding split-K: forced single split vs automatic split ---")
+    for ctx_len, num_seqs in [(2048, 1), (2048, 8), (8192, 1)]:
+        bench_flash_decoding(ctx_len, num_seqs)
 
 
 if __name__ == "__main__":
