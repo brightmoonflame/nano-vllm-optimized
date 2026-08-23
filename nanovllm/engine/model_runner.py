@@ -35,6 +35,18 @@ model_dict = {
 }
 
 
+def _mark_cudagraph_step_begin():
+    """Separate Inductor CUDA-Graph-Tree iterations when available.
+
+    The model contains independently ``torch.compile``-decorated modules.
+    Explicit step boundaries prevent their internal graph trees from retaining
+    outputs across captures of different static prefill shapes.
+    """
+    marker = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+    if marker is not None:
+        marker()
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -536,6 +548,7 @@ class ModelRunner:
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        _mark_cudagraph_step_begin()
         graph.replay()
         self.decode_graph_replay_count += 1
         return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -595,6 +608,7 @@ class ModelRunner:
             graph_vars["positions"][actual_tokens:].zero_()
         graph_vars["slot_mapping"].fill_(-1)
         graph_vars["slot_mapping"][:actual_tokens] = get_context().slot_mapping
+        _mark_cudagraph_step_begin()
         self.prefill_graphs[bucket].replay()
         self.prefill_graph_replay_count += 1
 
@@ -775,9 +789,9 @@ class ModelRunner:
         self.prefill_graphs = {}
         self.prefill_graph_vars = {}
 
-        # Each token bucket needs an independent graph pool. Capture buckets
-        # from small to large so each shape-specific compiled variant is warmed
-        # and captured before a larger shape is introduced.
+        # Each token bucket uses an independent capture. Explicit iteration
+        # marks isolate internal torch.compile CUDA-Graph-Tree state between
+        # different static shapes.
         for bucket in self.prefill_graph_tokens:
             input_ids = torch.zeros(bucket, dtype=torch.int64)
             positions = torch.zeros(bucket, dtype=torch.int64)
@@ -788,7 +802,9 @@ class ModelRunner:
 
             # Captured prefill is a single causal sequence without a prefix cache.
             set_context(True, cu_seqlens, cu_seqlens, bucket, bucket, slot_mapping)
+            _mark_cudagraph_step_begin()
             outputs.copy_(self.model(input_ids, positions))  # warmup
+            _mark_cudagraph_step_begin()
             with torch.cuda.graph(graph):
                 outputs.copy_(self.model(input_ids, positions))
             self.prefill_graphs[bucket] = graph
@@ -820,7 +836,9 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            _mark_cudagraph_step_begin()
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            _mark_cudagraph_step_begin()
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
