@@ -14,7 +14,6 @@ class Config:
     enforce_eager: bool = False
     enable_chunked_prefill: bool = False
     prefill_chunk_size: int = 1024
-    enable_prefill_cudagraph: bool = False
     kv_quant: bool = False
     use_triton_attn: bool = False   # False=走 flash_attn 包(默认); True=走自研 Triton 内核
     speculative_config: dict | None = None

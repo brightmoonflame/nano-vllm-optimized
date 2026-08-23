@@ -115,7 +115,6 @@ EAGLE 论文训练损失：`L_reg = SmoothL1(f_{i+1}, Draft_Model(T_{2:i+1}, F_{
 | 调度器 | `engine/scheduler.py` | prefix-cache 规避：spec 开启时 `can_allocate` 强制全量分配 |
 | Block 管理 | `engine/block_manager.py` | `can_allocate()` 支持 `enable_prefix_cache` 参数 |
 | 模型运行器 | `engine/model_runner.py` | `run_spec()` 骨架、`prepare_spec_decode()` |
-| 模型运行器 | `engine/model_runner.py` | Prefill CUDA graph 与 spec decode 互斥 |
 | 引擎 | `engine/llm_engine.py` | `step()` 路由到 `postprocess_spec` |
 
 ### 1.2 未完成的缺口
@@ -365,5 +364,4 @@ EAGLE3 的训练配对（`L_reg = SmoothL1(f_{i+1}, Draft(T_{2:i+1}, F_{1:i}))`�
 - [x] `engine/scheduler.py`: prefix-cache 规避（spec 开启时强制全量分配）
 - [x] `engine/block_manager.py`: `can_allocate()` 支持 `enable_prefix_cache`
 - [x] `engine/model_runner.py`: `run_spec()` 骨架 + `prepare_spec_decode()`
-- [x] `engine/model_runner.py`: prefill CUDA graph 与 spec decode 互斥
 - [x] `engine/llm_engine.py`: `step()` 路由到 `postprocess_spec`

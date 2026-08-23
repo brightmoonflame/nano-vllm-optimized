@@ -216,7 +216,7 @@ The 32× TTFT reduction comes from interleaving: the first request only needs to
 
 INT8 cuts per-block memory to ~63% of BF16, fitting ~1.6× the blocks (and therefore ~1.6× the max context or concurrent sequences) into the same GPU budget. The ratio is 1.6× rather than 2× because the group-wise scales add overhead: each (token, head) costs 128 B (INT8 data) + 32 B (8 × FP32 scales) = 160 B vs 256 B for BF16. With the fused Triton dequant kernel, this no longer costs throughput — see below.
 
-#### CUDA Graph (`serving_bench.py` + `bench_prefill_graph.py`)
+#### Decode CUDA Graph (`serving_bench.py` + `bench_int8_cudagraph.py`)
 
 **Decode CUDA Graph** (256 requests, 512-token inputs, 128-token outputs, serving 8 req/s). The gain scales inversely with model size — launch overhead is a bigger fraction of per-step cost on small models:
 
@@ -226,15 +226,6 @@ INT8 cuts per-block memory to ~63% of BF16, fitting ~1.6× the blocks (and there
 | Llama-3.2-3B | 42.3 ms | 40.0 ms | ~1.1× |
 
 Decode processes only 1 token per sequence per step, so kernel-launch overhead dominates on small models; on 3B the per-step compute is large enough that launch overhead shrinks to ~5–10%.
-
-**Prefill CUDA Graph** (single-request first Dense Prefill):
-
-| Prompt length | Graph OFF | Graph ON | Delta |
-| --- | ---: | ---: | ---: |
-| 1024 | 15.9 ms | 16.0 ms | +0.1 ms |
-| 8192 | 18.1 ms | 17.3 ms | -0.7 ms |
-
-Prefill processes hundreds to thousands of tokens per step, so kernel-launch overhead is a small fraction of total compute. On 0.6B–1B models the prefill itself takes only 3–5 ms, making graph savings (~1 ms) hard to measure. The feature is functionally correct and would show significant gains on 7B+ models where prefill exceeds 50 ms.
 
 #### Serving (`serving_bench.py`)
 
@@ -301,7 +292,6 @@ Attention, stay eager for correctness. Compare eager and graph Decode with
 python bench_triton_prefill.py
 python bench_triton_decode.py
 python bench_int8_cudagraph.py --model /root/model/Llama-3.2-3B-Instruct
-python bench_prefill_graph.py --model /root/model/Llama-3.2-3B-Instruct --use-triton-attn --kv-quant
 python test_cudagraph.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_memory.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct

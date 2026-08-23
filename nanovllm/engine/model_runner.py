@@ -5,8 +5,8 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-# warmup, CUDA-graph capture batch sizes and prefill shapes each need their own
-# compiled variant; the default limit (8) causes silent eager fallback.
+# Warmup and CUDA-graph Decode batch sizes need their own compiled variants;
+# the default limit (8) causes silent eager fallback.
 torch._dynamo.config.cache_size_limit = 64
 
 from nanovllm.config import Config
@@ -40,7 +40,7 @@ def _mark_cudagraph_step_begin():
 
     The model contains independently ``torch.compile``-decorated modules.
     Explicit step boundaries prevent their internal graph trees from retaining
-    outputs across captures of different static prefill shapes.
+    outputs across Decode graph captures.
     """
     marker = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
     if marker is not None:
@@ -60,7 +60,6 @@ class ModelRunner:
         # Lightweight observability for CUDA-Graph integration checks. These
         # counters are not part of the inference data path.
         self.decode_graph_replay_count = 0
-        self.prefill_graph_replay_count = 0
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -103,12 +102,6 @@ class ModelRunner:
             not config.kv_quant or self._int8_decode_cudagraph_safe
         ):
             self.capture_cudagraph()
-            # Prefill graphs never pass aux_layer_ids, so they can't produce the
-            # aux hidden states extend() needs — keep prompt prefill on the eager
-            # path whenever spec decode is on rather than teaching the graph
-            # about a second output tensor for a niche combination.
-            if config.enable_prefill_cudagraph and config.speculative_config is None:
-                self.capture_prefill_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -155,8 +148,6 @@ class ModelRunner:
                 self.shm.unlink()
         if hasattr(self, 'graphs'):
             del self.graphs, self.graph_pool
-        if hasattr(self, 'prefill_graphs'):
-            del self.prefill_graphs, self.prefill_graph_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -526,8 +517,6 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill:
-            if self._can_replay_prefill_graph(input_ids):
-                return self.run_prefill_cudagraph(input_ids, positions)
             return self.model.compute_logits(self._target_forward(input_ids, positions))
 
         if (
@@ -575,47 +564,6 @@ class ModelRunner:
         logits = self.model.compute_logits(self._target_forward(input_ids, positions))
         reset_context()
         return logits
-
-    def _can_replay_prefill_graph(self, input_ids: torch.Tensor) -> bool:
-        """Prefill graphs safely support one non-prefix sequence per replay.
-
-        A multi-sequence varlen batch has a dynamic cu_seqlens shape and needs a
-        separate graph for every (sequence-count, token-count) pair. It falls
-        back to the existing eager path to preserve correctness.
-        """
-        context = get_context()
-        return (
-            hasattr(self, "prefill_graphs")
-            and context.block_tables is None
-            and context.cu_seqlens_q.numel() == 2
-            and input_ids.numel() <= self.prefill_graph_tokens[-1]
-        )
-
-    def run_prefill_cudagraph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Replay a token-bucketed single-sequence prefill graph.
-
-        Padding is appended after the real prompt, so causal attention leaves
-        the hidden state of the prompt's final token unchanged. Padding slots
-        are -1, preventing writes to the KV cache.
-        """
-        actual_tokens = input_ids.numel()
-        bucket = next(size for size in self.prefill_graph_tokens if size >= actual_tokens)
-        graph_vars = self.prefill_graph_vars[bucket]
-        graph_vars["input_ids"][:actual_tokens] = input_ids
-        graph_vars["positions"][:actual_tokens] = positions
-        if actual_tokens < bucket:
-            graph_vars["input_ids"][actual_tokens:].zero_()
-            graph_vars["positions"][actual_tokens:].zero_()
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:actual_tokens] = get_context().slot_mapping
-        _mark_cudagraph_step_begin()
-        self.prefill_graphs[bucket].replay()
-        self.prefill_graph_replay_count += 1
-
-        # The captured context has cu_seqlens=[0, bucket], but only the real
-        # prompt's last hidden state should feed the LM head.
-        set_context(False)
-        return self.model.compute_logits(graph_vars["outputs"][actual_tokens - 1:actual_tokens])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
         # Speculative decode is only used for pure-decode steps; each entry in
@@ -777,45 +725,6 @@ class ModelRunner:
             token_ids = None
         reset_context()
         return token_ids
-
-    @torch.inference_mode()
-    def capture_prefill_cudagraph(self):
-        """Capture one-sequence prefill graphs grouped by total-token buckets."""
-        config = self.config
-        hf_config = config.hf_config
-        max_tokens = min(config.max_num_batched_tokens, config.max_model_len)
-        base_buckets = [256, 512, 1024, 2048, 4096, 8192, 12288, 16384]
-        self.prefill_graph_tokens = sorted({size for size in base_buckets if size < max_tokens} | {max_tokens})
-        self.prefill_graphs = {}
-        self.prefill_graph_vars = {}
-
-        # Each token bucket uses an independent capture. Explicit iteration
-        # marks isolate internal torch.compile CUDA-Graph-Tree state between
-        # different static shapes.
-        for bucket in self.prefill_graph_tokens:
-            input_ids = torch.zeros(bucket, dtype=torch.int64)
-            positions = torch.zeros(bucket, dtype=torch.int64)
-            slot_mapping = torch.full((bucket,), -1, dtype=torch.int32)
-            cu_seqlens = torch.tensor([0, bucket], dtype=torch.int32)
-            outputs = torch.zeros(bucket, hf_config.hidden_size)
-            graph = torch.cuda.CUDAGraph()
-
-            # Captured prefill is a single causal sequence without a prefix cache.
-            set_context(True, cu_seqlens, cu_seqlens, bucket, bucket, slot_mapping)
-            _mark_cudagraph_step_begin()
-            outputs.copy_(self.model(input_ids, positions))  # warmup
-            _mark_cudagraph_step_begin()
-            with torch.cuda.graph(graph):
-                outputs.copy_(self.model(input_ids, positions))
-            self.prefill_graphs[bucket] = graph
-            self.prefill_graph_vars[bucket] = dict(
-                input_ids=input_ids,
-                positions=positions,
-                slot_mapping=slot_mapping,
-                outputs=outputs,
-            )
-            torch.cuda.synchronize()
-            reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):

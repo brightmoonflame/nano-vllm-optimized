@@ -58,7 +58,6 @@ def parse_args() -> argparse.Namespace:
                    help="default: true for a fair raw-backend comparison; use --no-enforce-eager for CUDA Graph")
     p.add_argument("--enable-chunked-prefill", action="store_true")
     p.add_argument("--prefill-chunk-size", type=int, default=1024)
-    p.add_argument("--enable-prefill-cudagraph", action="store_true")
     p.add_argument("--warmup-requests", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output-json", type=Path,
@@ -101,8 +100,6 @@ def build_command(args: argparse.Namespace, kv_quant: bool, use_triton: bool, re
         cmd.append("--enforce-eager")
     if args.enable_chunked_prefill:
         cmd.extend(["--enable-chunked-prefill", "--prefill-chunk-size", str(args.prefill_chunk_size)])
-    if args.enable_prefill_cudagraph:
-        cmd.append("--enable-prefill-cudagraph")
     if kv_quant:
         cmd.append("--kv-quant")
     if use_triton:

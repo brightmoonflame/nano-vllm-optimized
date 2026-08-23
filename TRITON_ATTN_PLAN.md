@@ -119,7 +119,6 @@ Config.use_triton_attn
 ### 1.4 现有限制
 
 - `model_runner.py:73`:`kv_quant=True` 时禁用 CUDA graph(注释明写"动态反量化与 CUDA graph 不兼容");
-- prefill CUDA graph 与 spec decode 互斥(已有,不在本计划范围)。
 
 ---
 
@@ -432,7 +431,6 @@ prefix cache prefill = FA2 内核 + paged k/v 寻址 + 错位 causal + 双 cu_se
 
 - **Tree Attention / Spec Decode 的 Triton 化**:spec decode 已有独立计划(`SPEC_DECODE_PLAN.md`),其 draft 模型 attention 走同一个 `Attention` 模块,本计划完成后自动受益,不单独处理。
 - **FP8 KV cache**:INT8 跑通后再考虑,量化路径不同(scale 是 FP32 单值 vs FP8 E4M3),先不做。
-- **prefill chunked 的分段 CUDA Graph**:独立优化项,见后续计划。
 - **多卡 TP 下的 attention**:当前 attention kernel 是单卡内的,TP 通信在 attention 之外,本计划不涉及。
 
 ---

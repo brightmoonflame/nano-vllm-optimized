@@ -21,8 +21,6 @@ def main():
     enable_chunked_prefill = False
     # Toggle INT8 KV cache quantization (~37% per-block memory, ~1.6x capacity).
     kv_quant = False
-    # Toggle token-bucketed CUDA Graph for single-sequence prefill.
-    enable_prefill_cudagraph = False
 
     # Set draft_path=None to disable speculative decoding.
     speculative_config = {"model": draft_path, "num_spec_tokens": 5} if draft_path else None
@@ -43,7 +41,6 @@ def main():
 
     llm_no_spec = LLM(target_path, enforce_eager=True, max_model_len=4096,
                       enable_chunked_prefill=enable_chunked_prefill,
-                      enable_prefill_cudagraph=enable_prefill_cudagraph,
                       kv_quant=kv_quant,
                       gpu_memory_utilization=0.7,
                       speculative_config=None)
@@ -55,7 +52,6 @@ def main():
 
     llm = LLM(target_path, enforce_eager=True, max_model_len=4096,
               enable_chunked_prefill=enable_chunked_prefill,
-              enable_prefill_cudagraph=enable_prefill_cudagraph,
               kv_quant=kv_quant,
               gpu_memory_utilization=0.7,
               speculative_config=speculative_config)
@@ -84,7 +80,6 @@ def main():
     # --- Throughput comparison: same batch, spec off ---
     llm_no_spec = LLM(target_path, enforce_eager=True, max_model_len=4096,
                       enable_chunked_prefill=enable_chunked_prefill,
-                      enable_prefill_cudagraph=enable_prefill_cudagraph,
                       kv_quant=kv_quant,
                       gpu_memory_utilization=0.7,
                       speculative_config=None)
