@@ -302,6 +302,7 @@ python bench_triton_prefill.py
 python bench_triton_decode.py
 python bench_int8_cudagraph.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_prefill_graph.py --model /root/model/Llama-3.2-3B-Instruct --use-triton-attn --kv-quant
+python test_cudagraph.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_memory.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_teacher_forced.py --model /root/model/Llama-3.2-3B-Instruct

@@ -45,6 +45,10 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        # Lightweight observability for CUDA-Graph integration checks. These
+        # counters are not part of the inference data path.
+        self.decode_graph_replay_count = 0
+        self.prefill_graph_replay_count = 0
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -533,6 +537,7 @@ class ModelRunner:
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
         graph.replay()
+        self.decode_graph_replay_count += 1
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
@@ -591,6 +596,7 @@ class ModelRunner:
         graph_vars["slot_mapping"].fill_(-1)
         graph_vars["slot_mapping"][:actual_tokens] = get_context().slot_mapping
         self.prefill_graphs[bucket].replay()
+        self.prefill_graph_replay_count += 1
 
         # The captured context has cu_seqlens=[0, bucket], but only the real
         # prompt's last hidden state should feed the LM head.
