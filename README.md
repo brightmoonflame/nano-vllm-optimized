@@ -288,13 +288,19 @@ Together they show the INT8 cache is near-lossless *per step* (99.46%); the ~85%
 
 ### CUDA Graph
 
-With the fused INT8 kernel there is no dynamic dequant, so `kv_quant=True` no longer disables CUDA Graph — INT8 + Triton + CUDA Graph can be enabled together (run `example.py` with `enforce_eager=False`).
+For models whose target Attention layers all use the fused global Triton path
+(for example Llama/Qwen), INT8 KV Decode can also use CUDA Graph: the kernel
+reads INT8 K/V plus scales directly and creates no whole-cache BF16 temporary.
+Models with a FlashAttention fallback layer, such as Gemma sliding-window
+Attention, stay eager for correctness. Compare eager and graph Decode with
+`python bench_int8_cudagraph.py --model /root/model/Llama-3.2-3B-Instruct`.
 
 ### Commands
 
 ```bash
 python bench_triton_prefill.py
 python bench_triton_decode.py
+python bench_int8_cudagraph.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_memory.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_teacher_forced.py --model /root/model/Llama-3.2-3B-Instruct

@@ -303,6 +303,10 @@ def main() -> None:
         "kv_quant": args.kv_quant,
         "use_triton_attn": args.use_triton_attn,
         "enforce_eager": args.enforce_eager,
+        "decode_cudagraph_captured": hasattr(engine.model_runner, "graphs"),
+        "int8_decode_cudagraph_safe": getattr(
+            engine.model_runner, "_int8_decode_cudagraph_safe", False
+        ),
     }
     metrics: dict[int, RequestMetrics] = {}
     requests_sent = 0

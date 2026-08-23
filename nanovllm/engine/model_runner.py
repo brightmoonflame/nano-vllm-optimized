@@ -76,12 +76,16 @@ class ModelRunner:
             )
             self.rejection_sampler = RejectionSampler(self.sampler)
         self.allocate_kv_cache()
-        # KV quant's default path uses dynamic whole-cache dequant at decode
-        # time — incompatible with CUDA graph. With the fused Triton INT8
-        # kernel there is no dynamic op, so graphs are safe to capture.
+        # The fused Triton INT8 decode path reads the cache and scales directly
+        # in its attention kernel. It is graph-safe only when *every* target
+        # attention layer can use that path: sliding-window layers still fall
+        # back to flash-attn's dynamic whole-cache dequantization.
+        self._int8_decode_cudagraph_safe = self._supports_int8_decode_cudagraph()
         if config.use_triton_attn:
             self._alloc_mid_buffer()
-        if not self.enforce_eager and not (config.kv_quant and not config.use_triton_attn):
+        if not self.enforce_eager and (
+            not config.kv_quant or self._int8_decode_cudagraph_safe
+        ):
             self.capture_cudagraph()
             # Prefill graphs never pass aux_layer_ids, so they can't produce the
             # aux hidden states extend() needs — keep prompt prefill on the eager
@@ -100,6 +104,21 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
+
+    def _supports_int8_decode_cudagraph(self) -> bool:
+        """Whether all target attention layers use graph-safe fused INT8 decode.
+
+        The FlashAttention fallback materializes a whole BF16 paged cache via
+        ``dequant_kvcache`` each step, so it cannot be captured. In particular,
+        Gemma's sliding-window layers use that fallback even when the global
+        Triton flag is enabled.
+        """
+        attention_modules = [m for m in self.model.modules() if hasattr(m, "k_cache")]
+        return bool(attention_modules) and all(
+            getattr(m, "use_triton_attn", False)
+            and getattr(m, "sliding_window", None) is None
+            for m in attention_modules
+        )
 
     def drop_proposer_state(self, seq_ids: list[int]) -> None:
         """Free a finished/preempted sequence's draft-side state.
@@ -495,7 +514,11 @@ class ModelRunner:
                 return self.run_prefill_cudagraph(input_ids, positions)
             return self.model.compute_logits(self._target_forward(input_ids, positions))
 
-        if self.enforce_eager or input_ids.size(0) > 512 or self.config.kv_quant:
+        if (
+            self.enforce_eager
+            or input_ids.size(0) > 512
+            or (self.config.kv_quant and not self._int8_decode_cudagraph_safe)
+        ):
             return self.model.compute_logits(self.model(input_ids, positions))
 
         bs = input_ids.size(0)
