@@ -218,14 +218,20 @@ INT8 cuts per-block memory to ~63% of BF16, fitting ~1.6× the blocks (and there
 
 #### Decode CUDA Graph (`serving_bench.py` + `bench_int8_cudagraph.py`)
 
-**Decode CUDA Graph** (256 requests, 512-token inputs, 128-token outputs, serving 8 req/s). The gain scales inversely with model size — launch overhead is a bigger fraction of per-step cost on small models:
+On RTX 4090 with Llama-3.2-3B-Instruct, 128 offline requests, fixed 512-token
+inputs / 512-token outputs, and fused Triton INT8 KV Decode, only the Decode
+step is captured; Prefill remains eager in both runs. Greedy outputs match eager
+across Decode batch buckets `(3, 5, 17)`.
 
-| Model | Eager TPOT | CUDA Graph TPOT | Speedup |
+| Mode | Output throughput | TPOT p50 | Improvement |
 | --- | ---: | ---: | ---: |
-| Qwen3-0.6B | 35.3 ms | 3.7 ms | **9.5×** |
-| Llama-3.2-3B | 42.3 ms | 40.0 ms | ~1.1× |
+| INT8 Triton eager | 3677.4 tok/s | 29.68 ms | baseline |
+| INT8 Triton + Decode CUDA Graph | **4505.1 tok/s** | **23.96 ms** | **1.23× throughput**, **1.24× TPOT** |
 
-Decode processes only 1 token per sequence per step, so kernel-launch overhead dominates on small models; on 3B the per-step compute is large enough that launch overhead shrinks to ~5–10%.
+CUDA Graph removes repeated CPU launch overhead from the one-token Decode step:
+throughput improves by 23%, while TPOT drops by 19.3%. The comparison is
+reproducible with `bench_int8_cudagraph.py`; `test_cudagraph.py` verifies the
+same path's greedy output correctness.
 
 #### Serving (`serving_bench.py`)
 
