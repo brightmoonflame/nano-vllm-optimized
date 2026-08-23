@@ -227,7 +227,7 @@ INT8 cuts per-block memory to ~63% of BF16, fitting ~1.6× the blocks (and there
 
 Decode processes only 1 token per sequence per step, so kernel-launch overhead dominates on small models; on 3B the per-step compute is large enough that launch overhead shrinks to ~5–10%.
 
-**Prefill CUDA Graph** (Llama-3.2-1B, single request, `enforce_eager=True`):
+**Prefill CUDA Graph** (single-request first Dense Prefill):
 
 | Prompt length | Graph OFF | Graph ON | Delta |
 | --- | ---: | ---: | ---: |
@@ -301,6 +301,7 @@ Attention, stay eager for correctness. Compare eager and graph Decode with
 python bench_triton_prefill.py
 python bench_triton_decode.py
 python bench_int8_cudagraph.py --model /root/model/Llama-3.2-3B-Instruct
+python bench_prefill_graph.py --model /root/model/Llama-3.2-3B-Instruct --use-triton-attn --kv-quant
 python bench_memory.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_accuracy.py --model /root/model/Llama-3.2-3B-Instruct
 python bench_teacher_forced.py --model /root/model/Llama-3.2-3B-Instruct
