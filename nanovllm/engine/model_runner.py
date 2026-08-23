@@ -775,11 +775,10 @@ class ModelRunner:
         self.prefill_graphs = {}
         self.prefill_graph_vars = {}
 
-        # Each token bucket needs an independent graph pool. Unlike Decode's
-        # fixed batch buffers, prefill graphs retain bucket-specific temporary
-        # allocations; sharing a pool made smaller buckets replay stale state
-        # after the largest bucket had been captured.
-        for bucket in reversed(self.prefill_graph_tokens):
+        # Each token bucket needs an independent graph pool. Capture buckets
+        # from small to large so each shape-specific compiled variant is warmed
+        # and captured before a larger shape is introduced.
+        for bucket in self.prefill_graph_tokens:
             input_ids = torch.zeros(bucket, dtype=torch.int64)
             positions = torch.zeros(bucket, dtype=torch.int64)
             slot_mapping = torch.full((bucket,), -1, dtype=torch.int32)
