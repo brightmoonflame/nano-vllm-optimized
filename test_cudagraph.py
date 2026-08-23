@@ -86,8 +86,17 @@ def main() -> None:
     print("[2/2] CUDA Graph ...")
     graph_prefill, graph_decode, graph_replays = run_cases(args, graph_enabled=True)
 
-    assert eager_prefill == graph_prefill, "Dense Prefill greedy outputs differ: eager vs CUDA Graph"
-    assert eager_decode == graph_decode, "Decode greedy outputs differ: eager vs CUDA Graph"
+    if eager_prefill != graph_prefill:
+        print("Dense Prefill mismatch (eager → graph):")
+        for length in PREFILL_BOUNDARIES:
+            print(f"  {length}: {eager_prefill[length]} → {graph_prefill[length]}")
+        raise AssertionError("Dense Prefill greedy outputs differ: eager vs CUDA Graph")
+    if eager_decode != graph_decode:
+        print("Decode mismatch (eager → graph):")
+        for batch_size in DECODE_BATCH_SIZES:
+            if eager_decode[batch_size] != graph_decode[batch_size]:
+                print(f"  batch={batch_size}: {eager_decode[batch_size]} → {graph_decode[batch_size]}")
+        raise AssertionError("Decode greedy outputs differ: eager vs CUDA Graph")
     assert graph_replays[0] >= len(PREFILL_BOUNDARIES), "Prefill CUDA Graph did not replay every boundary case"
     assert graph_replays[1] > 0, "Decode CUDA Graph did not replay"
 
