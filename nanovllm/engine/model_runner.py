@@ -144,7 +144,7 @@ class ModelRunner:
         if hasattr(self, 'graphs'):
             del self.graphs, self.graph_pool
         if hasattr(self, 'prefill_graphs'):
-            del self.prefill_graphs, self.prefill_graph_vars, self.prefill_graph_pool
+            del self.prefill_graphs, self.prefill_graph_vars
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -774,9 +774,11 @@ class ModelRunner:
         self.prefill_graph_tokens = sorted({size for size in base_buckets if size < max_tokens} | {max_tokens})
         self.prefill_graphs = {}
         self.prefill_graph_vars = {}
-        self.prefill_graph_pool = None
 
-        # Capture largest first so smaller graphs can reuse the same pool.
+        # Each token bucket needs an independent graph pool. Unlike Decode's
+        # fixed batch buffers, prefill graphs retain bucket-specific temporary
+        # allocations; sharing a pool made smaller buckets replay stale state
+        # after the largest bucket had been captured.
         for bucket in reversed(self.prefill_graph_tokens):
             input_ids = torch.zeros(bucket, dtype=torch.int64)
             positions = torch.zeros(bucket, dtype=torch.int64)
@@ -788,10 +790,8 @@ class ModelRunner:
             # Captured prefill is a single causal sequence without a prefix cache.
             set_context(True, cu_seqlens, cu_seqlens, bucket, bucket, slot_mapping)
             outputs.copy_(self.model(input_ids, positions))  # warmup
-            with torch.cuda.graph(graph, self.prefill_graph_pool):
+            with torch.cuda.graph(graph):
                 outputs.copy_(self.model(input_ids, positions))
-            if self.prefill_graph_pool is None:
-                self.prefill_graph_pool = graph.pool()
             self.prefill_graphs[bucket] = graph
             self.prefill_graph_vars[bucket] = dict(
                 input_ids=input_ids,
