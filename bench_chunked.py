@@ -107,12 +107,15 @@ def run_benchmark(args, prompts, sampling_params, enable_chunked_prefill):
         last_times[index] = t
 
     all_tbts = [x for seq_tbts in tbts for x in seq_tbts]
+    ttft_p50 = statistics.median(ttfts)
     print(f"\n TTFT (ms): mean={statistics.mean(ttfts):7.1f} "
-          f"p50={statistics.median(ttfts):7.1f} "
+          f"p50={ttft_p50:7.1f} "
           f"p99={sorted(ttfts)[-1]:7.1f}")
+    tpot_p50 = None
     if all_tbts:
+        tpot_p50 = statistics.median(all_tbts)
         print(f" TPOT (ms): mean={statistics.mean(all_tbts):7.1f} "
-              f"p50={statistics.median(all_tbts):7.1f} "
+              f"p50={tpot_p50:7.1f} "
               f"p99={sorted(all_tbts)[-1]:7.1f}")
     print()
 
@@ -120,6 +123,7 @@ def run_benchmark(args, prompts, sampling_params, enable_chunked_prefill):
     del llm
     gc.collect()
     torch.cuda.empty_cache()
+    return {"ttft_p50": ttft_p50, "tpot_p50": tpot_p50}
 
 
 def main():
@@ -153,8 +157,20 @@ def main():
           f"mean={statistics.mean(token_counts):.0f}")
 
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
-    run_benchmark(args, prompts, sampling_params, enable_chunked_prefill=False)
-    run_benchmark(args, prompts, sampling_params, enable_chunked_prefill=True)
+    eager = run_benchmark(args, prompts, sampling_params, enable_chunked_prefill=False)
+    chunked = run_benchmark(args, prompts, sampling_params, enable_chunked_prefill=True)
+
+    def ratio(before, after):
+        return "n/a" if after is None or after == 0 else f"{before / after:.2f}x"
+
+    print("=" * 56)
+    print("Chunked Prefill summary  (OFF → ON; lower latency is better)")
+    print("=" * 56)
+    print(f"TTFT p50: {eager['ttft_p50']:.1f}ms → {chunked['ttft_p50']:.1f}ms "
+          f"({ratio(eager['ttft_p50'], chunked['ttft_p50'])})")
+    if eager["tpot_p50"] is not None and chunked["tpot_p50"] is not None:
+        print(f"TPOT p50: {eager['tpot_p50']:.1f}ms → {chunked['tpot_p50']:.1f}ms "
+              f"({ratio(eager['tpot_p50'], chunked['tpot_p50'])})")
 
 
 if __name__ == "__main__":
