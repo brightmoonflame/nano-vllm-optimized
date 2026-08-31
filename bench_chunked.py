@@ -1,8 +1,10 @@
-"""Chunked prefill benchmark — adapted from NKNaN/nano-vllm-chunked-prefill.
+"""Long-prompt Chunked Prefill A/B benchmark.
 
-Runs 8 requests with ~950-token prompts, compares TTFT/TBT with chunked
-prefill ON vs OFF. Uses enforce_eager for fair comparison.
+Runs the same long-prompt batch with Chunked Prefill OFF and ON.  The
+benchmark intentionally uses eager execution in both cases so CUDA Graph is
+not a confounding variable in the scheduling comparison.
 """
+import argparse
 import gc
 import os
 import statistics
@@ -66,8 +68,9 @@ QUESTIONS = [
 ]
 
 
-def make_prompts(tokenizer):
-    raw = [f"{q}:\n\n{LONG_PASSAGE}" for q in QUESTIONS]
+def make_prompts(tokenizer, num_requests: int, passage_repeats: int):
+    passage = "\n\n".join([LONG_PASSAGE] * passage_repeats)
+    raw = [f"{QUESTIONS[i % len(QUESTIONS)]}:\n\n{passage}" for i in range(num_requests)]
     return [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
@@ -76,14 +79,18 @@ def make_prompts(tokenizer):
     ]
 
 
-def run_benchmark(path, prompts, sampling_params, enable_chunked_prefill, prefill_chunk_size=512):
-    tag = (f"Chunked Prefill ON (chunk_size={prefill_chunk_size})"
+def run_benchmark(args, prompts, sampling_params, enable_chunked_prefill):
+    tag = (f"Chunked Prefill ON (chunk_size={args.prefill_chunk_size})"
            if enable_chunked_prefill else "Chunked Prefill OFF")
     print(f"\n{'='*56}\n {tag}\n{'='*56}")
 
-    llm = LLM(path, enforce_eager=True,
+    llm = LLM(args.model, enforce_eager=True,
               enable_chunked_prefill=enable_chunked_prefill,
-              prefill_chunk_size=prefill_chunk_size)
+              prefill_chunk_size=args.prefill_chunk_size,
+              max_model_len=args.max_model_len,
+              max_num_seqs=args.max_num_seqs,
+              max_num_batched_tokens=args.max_num_batched_tokens,
+              gpu_memory_utilization=args.gpu_memory_utilization)
 
     n = len(prompts)
     ttfts = [None] * n
@@ -116,18 +123,38 @@ def run_benchmark(path, prompts, sampling_params, enable_chunked_prefill, prefil
 
 
 def main():
-    path = os.path.expanduser("/root/model/Qwen3-0.6B/")
-    tokenizer = AutoTokenizer.from_pretrained(path)
-    prompts = make_prompts(tokenizer)
+    parser = argparse.ArgumentParser(description="Compare Chunked Prefill OFF vs ON on one long-prompt batch.")
+    parser.add_argument("--model", required=True, help="Path to a local Hugging Face model directory.")
+    parser.add_argument("--num-requests", type=int, default=8)
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--prefill-chunk-size", type=int, default=512)
+    parser.add_argument("--passage-repeats", type=int, default=1,
+                        help="Repeat the built-in passage to create a longer prompt.")
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-num-seqs", type=int, default=128)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    args.model = os.path.expanduser(args.model)
+    if args.num_requests <= 0 or args.max_tokens <= 0 or args.passage_repeats <= 0:
+        parser.error("--num-requests, --max-tokens, and --passage-repeats must be positive")
+    if args.prefill_chunk_size <= 0 or args.max_model_len <= 0:
+        parser.error("--prefill-chunk-size and --max-model-len must be positive")
+
+    torch.manual_seed(args.seed)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    prompts = make_prompts(tokenizer, args.num_requests, args.passage_repeats)
     token_counts = [len(tokenizer.encode(p)) for p in prompts]
-    print(f"Batch : {len(prompts)} requests")
+    print(f"model : {args.model}")
+    print(f"Batch : {len(prompts)} requests  eager=True  seed={args.seed}")
     print(f"Tokens: min={min(token_counts)} max={max(token_counts)} "
           f"mean={statistics.mean(token_counts):.0f}")
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=128)
-    run_benchmark(path, prompts, sampling_params, enable_chunked_prefill=False)
-    run_benchmark(path, prompts, sampling_params,
-                  enable_chunked_prefill=True, prefill_chunk_size=512)
+    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
+    run_benchmark(args, prompts, sampling_params, enable_chunked_prefill=False)
+    run_benchmark(args, prompts, sampling_params, enable_chunked_prefill=True)
 
 
 if __name__ == "__main__":
